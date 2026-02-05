@@ -6,16 +6,14 @@ import secrets
 import sqlite3
 from datetime import datetime
 from io import StringIO
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-# Persisted file next to this script (NOTE: on Render free tier, disk can reset on redeploy)
 DB_PATH = os.path.join(os.path.dirname(__file__), "judging.sqlite")
-
 app = FastAPI()
 
 
@@ -30,6 +28,11 @@ def db() -> sqlite3.Connection:
 
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def short_code(n: int = 4) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no confusing I/1/O/0
+    return "".join(secrets.choice(alphabet) for _ in range(n))
 
 
 def init_db():
@@ -49,7 +52,19 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id INTEGER NOT NULL,
                 bib TEXT NOT NULL,
+                competitor_name TEXT,
                 UNIQUE(event_id, bib)
+            );
+
+            CREATE TABLE IF NOT EXISTS rounds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                round_name TEXT NOT NULL,
+                round_type TEXT NOT NULL, -- 'final' or 'prelim'
+                yes_count INTEGER,        -- prelim only
+                alt_count INTEGER,        -- prelim only
+                locked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS judges (
@@ -57,25 +72,26 @@ def init_db():
                 event_id INTEGER NOT NULL,
                 judge_name TEXT NOT NULL,
                 judge_token TEXT NOT NULL,
-                last_submit_at TEXT,
+                created_at TEXT NOT NULL,
                 UNIQUE(event_id, judge_name)
             );
 
-            -- marks stores raw score, but admin/results will only show derived placements + totals
             CREATE TABLE IF NOT EXISTS marks (
-                event_id INTEGER NOT NULL,
+                round_id INTEGER NOT NULL,
                 judge_id INTEGER NOT NULL,
                 bib TEXT NOT NULL,
                 score INTEGER,
-                PRIMARY KEY (event_id, judge_id, bib)
+                PRIMARY KEY (round_id, judge_id, bib)
+            );
+
+            CREATE TABLE IF NOT EXISTS judge_round_submissions (
+                round_id INTEGER NOT NULL,
+                judge_id INTEGER NOT NULL,
+                submitted_at TEXT NOT NULL,
+                PRIMARY KEY (round_id, judge_id)
             );
             """
         )
-
-        # Simple migration safety if an older table exists
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(marks)").fetchall()]
-        if "score" not in cols:
-            conn.execute("ALTER TABLE marks ADD COLUMN score INTEGER")
 
 
 @app.on_event("startup")
@@ -87,9 +103,9 @@ def require_admin(event_id: int, admin_password: str) -> None:
     with db() as conn:
         row = conn.execute("SELECT admin_pw_hash FROM events WHERE id=?", (event_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Event not found.")
+            raise HTTPException(404, "Event not found.")
         if sha256(admin_password) != row["admin_pw_hash"]:
-            raise HTTPException(status_code=403, detail="Invalid admin password.")
+            raise HTTPException(403, "Invalid admin password.")
 
 
 def require_judge(event_id: int, judge_id: int, token: str) -> sqlite3.Row:
@@ -103,79 +119,6 @@ def require_judge(event_id: int, judge_id: int, token: str) -> sqlite3.Row:
     return row
 
 
-# -----------------------
-# Scoring -> placements -> final rank
-# -----------------------
-def scores_to_placements(scores_by_bib: Dict[str, int]) -> Dict[str, int]:
-    """
-    Convert one judge's unique scores (0-100) into placements:
-    highest score => placement 1, lowest => placement N.
-    Assumes scores are unique (enforced elsewhere).
-    """
-    ordered = sorted(scores_by_bib.items(), key=lambda kv: (-kv[1], str(kv[0])))
-    placements: Dict[str, int] = {}
-    for idx, (bib, _score) in enumerate(ordered, start=1):
-        placements[str(bib)] = idx
-    return placements
-
-
-def compute_final_results(judge_scores: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    judge_scores:
-      rows = judge_name
-      cols = bib
-      values = score (0-100)
-
-    Returns:
-      results_df columns: FinalRank, Bib, TotalScore, SumPlacements
-      placements_matrix rows=judge_name cols=bib values=placement
-    """
-    if judge_scores.shape[0] == 0 or judge_scores.shape[1] == 0:
-        raise ValueError("No judge scores available.")
-
-    # Ensure numeric
-    scores = judge_scores.apply(pd.to_numeric, errors="coerce")
-
-    # Create placement matrix per judge
-    placement_rows = {}
-    for judge_name in scores.index:
-        row = scores.loc[judge_name].to_dict()
-        # drop missing
-        row_clean = {str(b): int(v) for b, v in row.items() if pd.notna(v)}
-        if len(row_clean) != len(scores.columns):
-            raise ValueError(f"Judge '{judge_name}' is missing scores for one or more bibs.")
-        if len(set(row_clean.values())) != len(row_clean.values()):
-            raise ValueError(f"Judge '{judge_name}' has duplicate scores (not allowed).")
-        placement_rows[judge_name] = scores_to_placements(row_clean)
-
-    placements = pd.DataFrame.from_dict(placement_rows, orient="index")[scores.columns]
-
-    # Final ranking based on total score across judges
-    total_score = scores.sum(axis=0, skipna=False)  # should be complete
-    sum_placements = placements.sum(axis=0)
-
-    results = pd.DataFrame(
-        {
-            "Bib": scores.columns.astype(str),
-            "TotalScore": [float(total_score[b]) for b in scores.columns],
-            "SumPlacements": [int(sum_placements[b]) for b in scores.columns],
-        }
-    )
-
-    # Sort: higher total score wins; tie-breaker: lower sum placements; then bib
-    results = results.sort_values(
-        by=["TotalScore", "SumPlacements", "Bib"],
-        ascending=[False, True, True],
-        kind="mergesort",
-    ).reset_index(drop=True)
-
-    results.insert(0, "FinalRank", range(1, len(results) + 1))
-    return results, placements
-
-
-# -----------------------
-# UI helpers
-# -----------------------
 def page(title: str, body: str) -> HTMLResponse:
     html = f"""
     <html>
@@ -183,14 +126,14 @@ def page(title: str, body: str) -> HTMLResponse:
         <title>{title}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-          body {{ font-family: system-ui, Arial; max-width: 980px; margin: 0 auto; padding: 22px; }}
-          input, textarea, button {{ font-size: 16px; padding: 10px; }}
+          body {{ font-family: system-ui, Arial; max-width: 1200px; margin: 0 auto; padding: 22px; }}
+          input, textarea, button, select {{ font-size: 16px; padding: 10px; }}
           textarea {{ width: 100%; }}
           .card {{ border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }}
           .row {{ display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }}
           .row > * {{ flex: 1; min-width: 220px; }}
           table {{ border-collapse: collapse; width: 100%; }}
-          th, td {{ border: 1px solid #ddd; padding: 8px; }}
+          th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
           th {{ text-align: left; background: #f7f7f7; }}
           .muted {{ color: #666; }}
           .pill {{ display:inline-block; padding:4px 10px; border:1px solid #ddd; border-radius:999px; }}
@@ -198,6 +141,9 @@ def page(title: str, body: str) -> HTMLResponse:
           .danger {{ color: #b00020; }}
           .ok {{ color: #2e7d32; }}
           .score-pill {{ display:inline-block; min-width: 44px; text-align:center; border:1px solid #ddd; border-radius:999px; padding:2px 8px; margin-left: 10px; }}
+          .bg-green {{ background: #e7f6ea; }}
+          .bg-yellow {{ background: #fff7df; }}
+          .bg-red {{ background: #ffe5e5; }}
         </style>
       </head>
       <body>
@@ -207,6 +153,204 @@ def page(title: str, body: str) -> HTMLResponse:
     </html>
     """
     return HTMLResponse(html)
+
+
+# -----------------------
+# Skating (majority-based)
+# -----------------------
+def skating_rank(judge_placements: pd.DataFrame) -> pd.DataFrame:
+    """
+    judge_placements:
+      index = judge_name
+      columns = bib
+      values = placement (1=best)
+
+    Returns DataFrame: Place, Bib
+    """
+    marks = judge_placements.apply(pd.to_numeric, errors="coerce")
+    marks = marks.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if marks.shape[0] == 0 or marks.shape[1] == 0:
+        raise ValueError("No usable placement data.")
+
+    num_judges = marks.shape[0]
+    majority_needed = num_judges // 2 + 1
+    max_place = int(np.nanmax(marks.values))
+
+    remaining_bibs = list(marks.columns)
+    total_sum = marks.sum(axis=0, skipna=True)
+    final_order: list[str] = []
+
+    for _rank in range(1, len(remaining_bibs) + 1):
+        if len(remaining_bibs) == 1:
+            final_order.append(remaining_bibs[0])
+            break
+
+        tied = remaining_bibs.copy()
+        picked = None
+
+        for k in range(1, max_place + 1):
+            stats = []
+            for bib in tied:
+                bib_marks = marks[bib].dropna().astype(int)
+                count_le_k = int((bib_marks <= k).sum())
+                sum_le_k = int(bib_marks[bib_marks <= k].sum()) if count_le_k > 0 else 10**9
+                stats.append((bib, count_le_k, sum_le_k))
+
+            majority_candidates = [s for s in stats if s[1] >= majority_needed]
+            if not majority_candidates:
+                continue
+
+            majority_candidates.sort(key=lambda x: (-x[1], x[2]))
+            best_count = majority_candidates[0][1]
+            best_sum = majority_candidates[0][2]
+            best = [s for s in majority_candidates if s[1] == best_count and s[2] == best_sum]
+
+            if len(best) == 1:
+                picked = best[0][0]
+                break
+
+            tied = [s[0] for s in best]
+
+        if picked is None:
+            picked = sorted(tied, key=lambda b: (float(total_sum.loc[b]), str(b)))[0]
+
+        final_order.append(picked)
+        remaining_bibs.remove(picked)
+
+    return pd.DataFrame({"Place": range(1, len(final_order) + 1), "Bib": final_order})
+
+
+# -----------------------
+# Conversions
+# -----------------------
+def scores_to_placements(scores_by_bib: Dict[str, int]) -> Dict[str, int]:
+    ordered = sorted(scores_by_bib.items(), key=lambda kv: (-kv[1], str(kv[0])))
+    placements: Dict[str, int] = {}
+    for idx, (bib, _score) in enumerate(ordered, start=1):
+        placements[str(bib)] = idx
+    return placements
+
+
+def load_competitors(event_id: int) -> pd.DataFrame:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT bib, competitor_name FROM competitors WHERE event_id=? ORDER BY bib",
+            (event_id,),
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["Bib", "Competitor"])
+    return pd.DataFrame(
+        {"Bib": [r["bib"] for r in rows], "Competitor": [r["competitor_name"] or "" for r in rows]}
+    )
+
+
+def load_round_scores(round_id: int) -> Tuple[int, int, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns: event_id, round_type, scores_df(rows=judge, cols=bib), competitors_df(Bib, Competitor)
+    """
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise ValueError("Round not found.")
+        event_id = int(rnd["event_id"])
+        round_type = rnd["round_type"]
+
+        comps = load_competitors(event_id)
+        bibs = comps["Bib"].astype(str).tolist()
+
+        judges = conn.execute(
+            "SELECT id, judge_name FROM judges WHERE event_id=? ORDER BY judge_name",
+            (event_id,),
+        ).fetchall()
+
+        if not bibs:
+            raise ValueError("No bibs found.")
+        if not judges:
+            raise ValueError("No judges yet.")
+
+        data = {}
+        for j in judges:
+            row = {}
+            for b in bibs:
+                m = conn.execute(
+                    "SELECT score FROM marks WHERE round_id=? AND judge_id=? AND bib=?",
+                    (round_id, j["id"], b),
+                ).fetchone()
+                row[str(b)] = None if (m is None or m["score"] is None) else int(m["score"])
+            data[j["judge_name"]] = row
+
+    scores_df = pd.DataFrame.from_dict(data, orient="index")
+    scores_df = scores_df[[str(b) for b in bibs]]
+    return event_id, round_type, scores_df, comps
+
+
+def round_is_locked(round_id: int) -> bool:
+    with db() as conn:
+        rnd = conn.execute("SELECT locked FROM rounds WHERE id=?", (round_id,)).fetchone()
+    return bool(rnd and rnd["locked"])
+
+
+def judge_has_submitted(round_id: int, judge_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT submitted_at FROM judge_round_submissions WHERE round_id=? AND judge_id=?",
+            (round_id, judge_id),
+        ).fetchone()
+    return row is not None
+
+
+# -----------------------
+# Prelim callback math
+# -----------------------
+def prelim_points_for_rank(rank: int, y: int, a: int) -> float:
+    if rank <= y:
+        return 10.0
+    if y < rank <= y + a:
+        k = rank - y  # 1..a
+        return round(4.5 - 0.1 * (k - 1), 3)
+    return 0.0
+
+
+def compute_prelim_callback(scores_df: pd.DataFrame, y: int, a: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      placements_df (judge x bib placements),
+      points_df (judge x bib points),
+      summary_df with columns: Bib, TotalPoints, Callback (Y/N/A1/A2...)
+    """
+    scores = scores_df.apply(pd.to_numeric, errors="coerce")
+    if scores.isna().any().any():
+        raise ValueError("Missing score(s) for one or more judges/bibs.")
+
+    placements_rows = {}
+    points_rows = {}
+
+    for judge in scores.index:
+        row = scores.loc[judge].to_dict()
+        row_clean = {str(b): int(v) for b, v in row.items()}
+        if len(set(row_clean.values())) != len(row_clean.values()):
+            raise ValueError(f"Judge '{judge}' has duplicate scores.")
+
+        placements = scores_to_placements(row_clean)
+        placements_rows[judge] = placements
+
+        pts = {bib: prelim_points_for_rank(rank, y, a) for bib, rank in placements.items()}
+        points_rows[judge] = pts
+
+    placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
+    points_df = pd.DataFrame.from_dict(points_rows, orient="index")[scores.columns]
+
+    totals = points_df.sum(axis=0)
+    summary = pd.DataFrame({"Bib": scores.columns.astype(str), "TotalPoints": [float(totals[b]) for b in scores.columns]})
+    summary = summary.sort_values(by=["TotalPoints", "Bib"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
+
+    # Callback rules: YES = top (y+2), Alternates next 2
+    yes_n = min(len(summary), y + 2)
+    alt_n = min(len(summary) - yes_n, 2)
+
+    labels = ["Y"] * yes_n + [f"A{i+1}" for i in range(alt_n)] + ["N"] * (len(summary) - yes_n - alt_n)
+    summary["Callback"] = labels
+    return placements_df, points_df, summary
 
 
 # -----------------------
@@ -220,8 +364,7 @@ def home():
         <div class="card">
           <p><a href="/admin">Admin</a> | <a href="/judge">Judge</a></p>
           <p class="muted">
-            Finals-only scoring MVP: Judges score each competitor 0–100 with sliders (no duplicates).
-            System converts scores to placements and computes final rank by total score.
+            Events contain rounds. Finals use Skating. Prelims use callback math (Y/A) with sliders and no duplicates.
           </p>
         </div>
         """,
@@ -253,12 +396,12 @@ def admin_home():
       <h2>Create Event</h2>
       <form method="post" action="/admin/create">
         <div class="row">
-          <input name="event_name" placeholder="Event name (e.g., Jack & Jill Finals)" required />
+          <input name="event_name" placeholder="Event name" required />
           <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
         <button type="submit">Create</button>
       </form>
-      <p class="muted">Save the admin password. You’ll need it to edit bibs, lock, and compute results.</p>
+      <p class="muted">Join code is 4 characters. Admin password is required for edits/deletes.</p>
     </div>
 
     <div class="card">
@@ -274,7 +417,7 @@ def admin_home():
 
 @app.post("/admin/create")
 def admin_create(event_name: str = Form(...), admin_password: str = Form(...)):
-    join_code = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8].upper()
+    join_code = short_code(4)
     with db() as conn:
         conn.execute(
             "INSERT INTO events(name, admin_pw_hash, join_code, locked, created_at) VALUES(?,?,?,?,?)",
@@ -291,234 +434,501 @@ def admin_event(event_id: int):
         if not event:
             raise HTTPException(404, "Event not found.")
 
-        bibs = [r["bib"] for r in conn.execute(
-            "SELECT bib FROM competitors WHERE event_id=? ORDER BY bib", (event_id,)
-        ).fetchall()]
-
-        judges = conn.execute(
-            "SELECT id, judge_name, last_submit_at FROM judges WHERE event_id=? ORDER BY judge_name",
+        rounds = conn.execute(
+            "SELECT * FROM rounds WHERE event_id=? ORDER BY id DESC",
             (event_id,),
         ).fetchall()
 
-    bib_list = ", ".join(bibs) if bibs else "(none yet)"
+        comps = conn.execute(
+            "SELECT bib, competitor_name FROM competitors WHERE event_id=? ORDER BY bib",
+            (event_id,),
+        ).fetchall()
 
-    judge_rows = ""
-    for j in judges:
-        judge_rows += f"<tr><td>{j['judge_name']}</td><td>{j['last_submit_at'] or ''}</td></tr>"
-    if not judge_rows:
-        judge_rows = '<tr><td colspan="2" class="muted">No judges yet.</td></tr>'
+        judges = conn.execute(
+            "SELECT judge_name FROM judges WHERE event_id=? ORDER BY judge_name",
+            (event_id,),
+        ).fetchall()
+
+    rounds_rows = ""
+    for r in rounds:
+        typ = "Final" if r["round_type"] == "final" else f"Prelim (Y={r['yes_count']}, A={r['alt_count']})"
+        rounds_rows += f"""
+        <tr>
+          <td>{r["id"]}</td>
+          <td>{r["round_name"]}</td>
+          <td>{typ}</td>
+          <td>{'🔒' if r["locked"] else '🟢'}</td>
+          <td><a href="/admin/round/{r['id']}">Open</a></td>
+        </tr>
+        """
+    if not rounds_rows:
+        rounds_rows = '<tr><td colspan="5" class="muted">No rounds yet.</td></tr>'
+
+    comps_rows = ""
+    for c in comps:
+        comps_rows += f"<tr><td>{c['bib']}</td><td>{c['competitor_name'] or ''}</td></tr>"
+    if not comps_rows:
+        comps_rows = '<tr><td colspan="2" class="muted">No bibs yet.</td></tr>'
+
+    judges_list = ", ".join([j["judge_name"] for j in judges]) if judges else "(none yet)"
 
     body = f"""
     <div class="card">
       <p><a href="/admin">← Back to Admin</a></p>
       <h2>{event["name"]}</h2>
       <p>Join Code: <span class="pill">{event["join_code"]}</span> (Judges go to <a href="/judge">/judge</a>)</p>
-      <p>Status: {'🔒 Locked' if event["locked"] else '🟢 Open'}</p>
-      <p class="muted">Bibs: {bib_list}</p>
+      <p class="muted">Judges: {judges_list}</p>
     </div>
 
     <div class="card">
-      <h3>Add / Replace Bibs</h3>
+      <h3>Rounds</h3>
+      <table>
+        <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th></th></tr></thead>
+        <tbody>{rounds_rows}</tbody>
+      </table>
+
+      <h4 style="margin-top:16px;">Create Round</h4>
+      <form method="post" action="/admin/event/{event_id}/create_round">
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+          <input name="round_name" placeholder="Round name (e.g., Prelims / Finals)" required />
+          <select name="round_type" required>
+            <option value="final">Final (Skating)</option>
+            <option value="prelim">Prelim (Callback)</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <input name="yes_count" placeholder="Prelim YES count (Y) e.g., 7" type="number" min="1" />
+          <input name="alt_count" placeholder="Prelim ALT count (A) e.g., 3" type="number" min="0" />
+        </div>
+
+        <button type="submit">Create Round</button>
+        <p class="muted">For Final rounds, Y/A are ignored.</p>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Bibs (optional names)</h3>
       <form method="post" action="/admin/event/{event_id}/set_bibs">
         <div class="row">
           <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
-        <textarea name="bibs" rows="5" placeholder="One bib per line (or separated by commas)"></textarea>
-        <p class="muted">This replaces the bib list.</p>
+        <textarea name="bibs" rows="7" placeholder="One per line. Formats:
+219/210 | Jordan Frisbee and Elizabeth Spann
+966/220 | Jesse Lopez and Tatiana Mollmann
+(or just a bib with no name)"></textarea>
         <button type="submit">Save Bibs</button>
       </form>
-    </div>
 
-    <div class="card">
-      <h3>Judges</h3>
-      <table>
-        <thead><tr><th>Judge</th><th>Last Submit</th></tr></thead>
-        <tbody>{judge_rows}</tbody>
+      <table style="margin-top:12px;">
+        <thead><tr><th>Bib</th><th>Competitor</th></tr></thead>
+        <tbody>{comps_rows}</tbody>
       </table>
     </div>
 
     <div class="card">
-      <h3>Controls</h3>
-      <form method="post" action="/admin/event/{event_id}/toggle_lock" style="margin-bottom:12px;">
+      <h3>Delete Event</h3>
+      <form method="post" action="/admin/event/{event_id}/delete" onsubmit="return confirm('Delete this event? This deletes rounds, judges, and marks.');">
         <div class="row">
           <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
-        <button type="submit">{'Unlock' if event["locked"] else 'Lock'} Event</button>
+        <button type="submit" style="background:#ffe5e5;">Delete Event</button>
       </form>
-
-      <form method="post" action="/admin/event/{event_id}/compute">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-        </div>
-        <button type="submit">Compute Results</button>
-      </form>
-      <p class="muted">Admin will only see placements + computed final rank (no raw scores shown).</p>
     </div>
     """
     return page(f"Admin Event #{event_id}", body)
+
+
+@app.post("/admin/event/{event_id}/delete")
+def admin_delete_event(event_id: int, admin_password: str = Form(...)):
+    require_admin(event_id, admin_password)
+    with db() as conn:
+        # delete in dependency order
+        round_ids = [r["id"] for r in conn.execute("SELECT id FROM rounds WHERE event_id=?", (event_id,)).fetchall()]
+        for rid in round_ids:
+            conn.execute("DELETE FROM marks WHERE round_id=?", (rid,))
+            conn.execute("DELETE FROM judge_round_submissions WHERE round_id=?", (rid,))
+        conn.execute("DELETE FROM rounds WHERE event_id=?", (event_id,))
+        conn.execute("DELETE FROM competitors WHERE event_id=?", (event_id,))
+        conn.execute("DELETE FROM judges WHERE event_id=?", (event_id,))
+        conn.execute("DELETE FROM events WHERE id=?", (event_id,))
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/event/{event_id}/create_round")
+def admin_create_round(
+    event_id: int,
+    admin_password: str = Form(...),
+    round_name: str = Form(...),
+    round_type: str = Form(...),
+    yes_count: Optional[int] = Form(None),
+    alt_count: Optional[int] = Form(None),
+):
+    require_admin(event_id, admin_password)
+    round_type = round_type.strip().lower()
+    if round_type not in ("final", "prelim"):
+        raise HTTPException(400, "Invalid round type.")
+
+    y = int(yes_count) if yes_count is not None and str(yes_count) != "" else None
+    a = int(alt_count) if alt_count is not None and str(alt_count) != "" else None
+
+    if round_type == "prelim":
+        if y is None or y < 1:
+            raise HTTPException(400, "Prelim requires YES count (Y) >= 1.")
+        if a is None or a < 0:
+            raise HTTPException(400, "Prelim requires ALT count (A) >= 0.")
+        if a > 10:
+            # soft cap; you said max 5 recommended, but we won't hard-fail at 6+
+            a = a
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO rounds(event_id, round_name, round_type, yes_count, alt_count, locked, created_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (event_id, round_name.strip(), round_type, y, a, 0, datetime.utcnow().isoformat()),
+        )
+        rid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    return RedirectResponse(url=f"/admin/round/{rid}", status_code=303)
 
 
 @app.post("/admin/event/{event_id}/set_bibs")
 def admin_set_bibs(event_id: int, admin_password: str = Form(...), bibs: str = Form("")):
     require_admin(event_id, admin_password)
 
-    raw = bibs.replace(",", "\n")
-    bib_list = [b.strip() for b in raw.splitlines() if b.strip()]
-    bib_list = list(dict.fromkeys(bib_list))  # dedupe preserve order
+    lines = [ln.strip() for ln in bibs.replace(",", "\n").splitlines() if ln.strip()]
+    parsed: List[Tuple[str, str]] = []
+    for ln in lines:
+        if "|" in ln:
+            left, right = ln.split("|", 1)
+            bib = left.strip()
+            name = right.strip()
+        else:
+            bib = ln.strip()
+            name = ""
+        parsed.append((bib, name))
+
+    # dedupe by bib, keep first name encountered
+    seen = {}
+    for bib, name in parsed:
+        if bib not in seen:
+            seen[bib] = name
+    bib_list = list(seen.items())
 
     with db() as conn:
-        event = conn.execute("SELECT id FROM events WHERE id=?", (event_id,)).fetchone()
+        conn.execute("DELETE FROM competitors WHERE event_id=?", (event_id,))
+        for bib, name in bib_list:
+            conn.execute(
+                "INSERT OR IGNORE INTO competitors(event_id, bib, competitor_name) VALUES(?,?,?)",
+                (event_id, str(bib), name or None),
+            )
+    return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
+
+
+@app.get("/admin/round/{round_id}", response_class=HTMLResponse)
+def admin_round(round_id: int):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        event = conn.execute("SELECT * FROM events WHERE id=?", (rnd["event_id"],)).fetchone()
         if not event:
             raise HTTPException(404, "Event not found.")
-
-        conn.execute("DELETE FROM competitors WHERE event_id=?", (event_id,))
-        for b in bib_list:
-            conn.execute("INSERT OR IGNORE INTO competitors(event_id, bib) VALUES(?,?)", (event_id, str(b)))
-
-        # Remove marks for bibs that no longer exist
-        if bib_list:
-            placeholders = ",".join(["?"] * len(bib_list))
-            conn.execute(
-                f"DELETE FROM marks WHERE event_id=? AND bib NOT IN ({placeholders})",
-                (event_id, *bib_list),
-            )
-        else:
-            conn.execute("DELETE FROM marks WHERE event_id=?", (event_id,))
-
-    return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
-
-
-@app.post("/admin/event/{event_id}/toggle_lock")
-def admin_toggle_lock(event_id: int, admin_password: str = Form(...)):
-    require_admin(event_id, admin_password)
-    with db() as conn:
-        row = conn.execute("SELECT locked FROM events WHERE id=?", (event_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Event not found.")
-        new_val = 0 if row["locked"] else 1
-        conn.execute("UPDATE events SET locked=? WHERE id=?", (new_val, event_id))
-    return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
-
-
-def load_scores_dataframe(event_id: int) -> pd.DataFrame:
-    """Return judge_scores DataFrame rows=judge_name cols=bib values=score."""
-    with db() as conn:
-        bibs = [r["bib"] for r in conn.execute(
-            "SELECT bib FROM competitors WHERE event_id=? ORDER BY bib", (event_id,)
-        ).fetchall()]
 
         judges = conn.execute(
             "SELECT id, judge_name FROM judges WHERE event_id=? ORDER BY judge_name",
-            (event_id,),
+            (event["id"],),
         ).fetchall()
 
-        if not bibs:
-            raise ValueError("No bibs found.")
-        if not judges:
-            raise ValueError("No judges found.")
+        subs = conn.execute(
+            "SELECT judge_id, submitted_at FROM judge_round_submissions WHERE round_id=?",
+            (round_id,),
+        ).fetchall()
+        submitted_map = {s["judge_id"]: s["submitted_at"] for s in subs}
 
-        data = {}
-        for j in judges:
-            row = {}
-            for b in bibs:
-                m = conn.execute(
-                    "SELECT score FROM marks WHERE event_id=? AND judge_id=? AND bib=?",
-                    (event_id, j["id"], b),
-                ).fetchone()
-                row[str(b)] = None if (m is None or m["score"] is None) else int(m["score"])
-            data[j["judge_name"]] = row
-
-    df = pd.DataFrame.from_dict(data, orient="index")
-    # Ensure consistent column order
-    df = df[[str(b) for b in bibs]]
-    return df
-
-
-@app.post("/admin/event/{event_id}/compute", response_class=HTMLResponse)
-def admin_compute(event_id: int, admin_password: str = Form(...)):
-    require_admin(event_id, admin_password)
-
-    with db() as conn:
-        event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
-        if not event:
-            raise HTTPException(404, "Event not found.")
-
-    try:
-        judge_scores = load_scores_dataframe(event_id)
-        results_df, placements_df = compute_final_results(judge_scores)
-    except Exception as e:
-        return page(
-            "Compute Results",
-            f'<div class="card"><p class="danger">Error computing results:</p><pre>{e}</pre>'
-            f'<p class="muted">Common causes: missing scores for a judge, duplicates, or no bibs.</p></div>',
-        )
-
-    # Results table
-    result_rows = ""
-    for _, r in results_df.iterrows():
-        result_rows += (
-            f"<tr><td>{int(r['FinalRank'])}</td><td>{r['Bib']}</td>"
-            f"<td>{int(r['TotalScore'])}</td><td>{int(r['SumPlacements'])}</td></tr>"
-        )
-
-    # Placement matrix table (admin sees placements only)
-    mat_html = placements_df.copy()
-    mat_html.insert(0, "Judge", mat_html.index)
-    matrix_rows = ""
-    for _, row in mat_html.iterrows():
-        tds = "".join([f"<td>{row[c]}</td>" for c in mat_html.columns])
-        matrix_rows += f"<tr>{tds}</tr>"
-
-    matrix_head = "".join([f"<th>{c}</th>" for c in mat_html.columns])
+    typ = "Final (Skating)" if rnd["round_type"] == "final" else f"Prelim (Callback) Y={rnd['yes_count']} A={rnd['alt_count']}"
+    judges_rows = ""
+    for j in judges:
+        judges_rows += f"<tr><td>{j['judge_name']}</td><td>{submitted_map.get(j['id'], '')}</td></tr>"
+    if not judges_rows:
+        judges_rows = '<tr><td colspan="2" class="muted">No judges yet.</td></tr>'
 
     body = f"""
     <div class="card">
-      <p><a href="/admin/event/{event_id}">← Back to Event</a></p>
-      <h2>Results</h2>
-      <p class="muted">FinalRank is computed by TotalScore (highest wins). Tie-breakers: lower SumPlacements, then Bib.</p>
-      <p>
-        <a href="/admin/event/{event_id}/download/results?admin_password={admin_password}">Download Results CSV</a>
-        &nbsp;|&nbsp;
-        <a href="/admin/event/{event_id}/download/placements?admin_password={admin_password}">Download Judge Placements CSV</a>
-      </p>
+      <p><a href="/admin/event/{event['id']}">← Back to Event</a></p>
+      <h2>{event["name"]} | {rnd["round_name"]}</h2>
+      <p>Type: <span class="pill">{typ}</span></p>
+      <p>Status: {'🔒 Locked' if rnd["locked"] else '🟢 Open'}</p>
+    </div>
+
+    <div class="card">
+      <h3>Judge Submissions</h3>
       <table>
-        <thead><tr><th>FinalRank</th><th>Bib</th><th>TotalScore</th><th>SumPlacements</th></tr></thead>
-        <tbody>{result_rows}</tbody>
+        <thead><tr><th>Judge</th><th>Submitted At</th></tr></thead>
+        <tbody>{judges_rows}</tbody>
       </table>
     </div>
 
     <div class="card">
-      <h3>Judge Placements (scores hidden)</h3>
+      <h3>Controls</h3>
+      <form method="post" action="/admin/round/{round_id}/toggle_lock" style="margin-bottom:12px;">
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+        </div>
+        <button type="submit">{'Unlock' if rnd["locked"] else 'Lock'} Round</button>
+      </form>
+
+      <form method="post" action="/admin/round/{round_id}/compute">
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+        </div>
+        <button type="submit">Compute Results</button>
+      </form>
+
+      <p class="muted">
+        Downloads:
+        <a href="/admin/round/{round_id}/download/raw_scores?admin_password=__PW__">Raw scores CSV</a> |
+        <a href="/admin/round/{round_id}/download/placements?admin_password=__PW__">Placements CSV</a>
+      </p>
+      <p class="muted">Tip: replace __PW__ with your admin password after computing if you want quick links.</p>
+    </div>
+    """
+    return page("Admin Round", body)
+
+
+@app.post("/admin/round/{round_id}/toggle_lock")
+def admin_toggle_round_lock(round_id: int, admin_password: str = Form(...)):
+    with db() as conn:
+        rnd = conn.execute("SELECT event_id, locked FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
+        new_val = 0 if rnd["locked"] else 1
+        conn.execute("UPDATE rounds SET locked=? WHERE id=?", (new_val, round_id))
+    return RedirectResponse(url=f"/admin/round/{round_id}", status_code=303)
+
+
+@app.post("/admin/round/{round_id}/compute", response_class=HTMLResponse)
+def admin_compute_round(round_id: int, admin_password: str = Form(...)):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
+
+    try:
+        event_id, round_type, scores_df, comps_df = load_round_scores(round_id)
+    except Exception as e:
+        return page("Compute Results", f'<div class="card"><p class="danger">Error:</p><pre>{e}</pre></div>')
+
+    # Validate completeness + uniqueness per judge
+    scores = scores_df.apply(pd.to_numeric, errors="coerce")
+    if scores.isna().any().any():
+        return page("Compute Results", '<div class="card"><p class="danger">Missing score(s) detected.</p></div>')
+    for j in scores.index:
+        vals = list(scores.loc[j].astype(int).values)
+        if len(set(vals)) != len(vals):
+            return page("Compute Results", f'<div class="card"><p class="danger">Duplicate score(s) for judge {j}.</p></div>')
+
+    # Compute placements matrix
+    placements_rows = {}
+    for j in scores.index:
+        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        placements_rows[j] = scores_to_placements(row)
+    placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
+
+    # Admin raw scores view
+    raw_scores_df = scores.copy()
+    raw_scores_df.insert(0, "Judge", raw_scores_df.index)
+
+    # Join bib->name
+    bib_to_name = dict(zip(comps_df["Bib"].astype(str), comps_df["Competitor"].astype(str)))
+
+    if round_type == "final":
+        # Skating final
+        final_df = skating_rank(placements_df)
+        # Build display table like your screenshot
+        judges = list(placements_df.index)
+
+        rows_html = ""
+        for _, r in final_df.iterrows():
+            bib = str(r["Bib"])
+            place = int(r["Place"])
+            comp_name = bib_to_name.get(bib, "")
+            marks = [int(placements_df.loc[j, bib]) for j in judges]
+            marks_sorted = "-".join(str(x) for x in sorted(marks))
+            judge_cells = "".join(f"<td>{int(placements_df.loc[j, bib])}</td>" for j in judges)
+
+            rows_html += f"""
+            <tr>
+              <td>{place}</td>
+              <td>{comp_name}</td>
+              {judge_cells}
+              <td>{bib}</td>
+              <td>{marks_sorted}</td>
+            </tr>
+            """
+
+        head_judges = "".join(f"<th>{j}</th>" for j in judges)
+
+        # Raw scores table
+        raw_rows = ""
+        for j in scores.index:
+            raw_rows += "<tr>" + "".join([f"<td>{j}</td>"] + [f"<td>{int(scores.loc[j, b])}</td>" for b in scores.columns]) + "</tr>"
+        raw_head = "".join([f"<th>{b}</th>" for b in scores.columns])
+
+        body = f"""
+        <div class="card">
+          <p><a href="/admin/round/{round_id}">← Back to Round</a></p>
+          <h2>Final Results (Skating)</h2>
+          <p>
+            <a href="/admin/round/{round_id}/download/final_results?admin_password={admin_password}">Download Results CSV</a> |
+            <a href="/admin/round/{round_id}/download/placements?admin_password={admin_password}">Download Placements CSV</a> |
+            <a href="/admin/round/{round_id}/download/raw_scores?admin_password={admin_password}">Download Raw Scores CSV</a>
+          </p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Place</th>
+                <th>Competitor</th>
+                {head_judges}
+                <th>BIB</th>
+                <th>Marks Sorted</th>
+              </tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3>Raw Scores (Admin Only)</h3>
+          <table>
+            <thead><tr><th>Judge</th>{raw_head}</tr></thead>
+            <tbody>{raw_rows}</tbody>
+          </table>
+        </div>
+        """
+        return page("Final Results", body)
+
+    # Prelim callback
+    y = int(rnd["yes_count"] or 0)
+    a = int(rnd["alt_count"] or 0)
+
+    try:
+        placements_df2, points_df, summary_df = compute_prelim_callback(scores_df, y, a)
+    except Exception as e:
+        return page("Prelim Results", f'<div class="card"><p class="danger">Error:</p><pre>{e}</pre></div>')
+
+    # Display summary table
+    rows_html = ""
+    for _, r in summary_df.iterrows():
+        bib = str(r["Bib"])
+        comp_name = bib_to_name.get(bib, "")
+        rows_html += f"""
+        <tr>
+          <td>{comp_name}</td>
+          <td>{bib}</td>
+          <td>{r["Callback"]}</td>
+          <td>{r["TotalPoints"]:.3f}</td>
+        </tr>
+        """
+
+    # Raw scores + per-judge placement/points tables (admin can see)
+    judges = list(scores_df.index)
+
+    # Per-judge placement/points table per competitor (like a matrix)
+    placement_matrix = placements_df2.copy()
+    placement_matrix.insert(0, "Competitor", [bib_to_name.get(str(b), "") for b in placement_matrix.columns])
+    # too wide for html with competitor as col; we'll show judge x bib table
+    # Build judge x bib placement
+    jxb_rows = ""
+    for j in judges:
+        jxb_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(placements_df2.loc[j, b])}</td>" for b in placements_df2.columns]) + "</tr>"
+    head_bibs = "".join([f"<th>{b}</th>" for b in placements_df2.columns])
+
+    # raw scores judge x bib
+    raw_rows = ""
+    for j in judges:
+        raw_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(scores_df.loc[j, b])}</td>" for b in scores_df.columns]) + "</tr>"
+    raw_head = "".join([f"<th>{b}</th>" for b in scores_df.columns])
+
+    body = f"""
+    <div class="card">
+      <p><a href="/admin/round/{round_id}">← Back to Round</a></p>
+      <h2>Prelim Callback Results</h2>
+      <p class="muted">YES = top {y}+2; Alternates = next 2 (A1, A2); rest N.</p>
+      <p>
+        <a href="/admin/round/{round_id}/download/prelim_summary?admin_password={admin_password}">Download Summary CSV</a> |
+        <a href="/admin/round/{round_id}/download/placements?admin_password={admin_password}">Download Placements CSV</a> |
+        <a href="/admin/round/{round_id}/download/raw_scores?admin_password={admin_password}">Download Raw Scores CSV</a>
+      </p>
+
       <table>
-        <thead><tr>{matrix_head}</tr></thead>
-        <tbody>{matrix_rows}</tbody>
+        <thead><tr><th>Competitor</th><th>BIB</th><th>Callback</th><th>Total Points</th></tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Judge Placements (Admin)</h3>
+      <table>
+        <thead><tr><th>Judge</th>{head_bibs}</tr></thead>
+        <tbody>{jxb_rows}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Raw Scores (Admin Only)</h3>
+      <table>
+        <thead><tr><th>Judge</th>{raw_head}</tr></thead>
+        <tbody>{raw_rows}</tbody>
       </table>
     </div>
     """
-    return page("Results", body)
+    return page("Prelim Results", body)
 
 
-@app.get("/admin/event/{event_id}/download/results")
-def download_results(event_id: int, admin_password: str):
-    require_admin(event_id, admin_password)
-    judge_scores = load_scores_dataframe(event_id)
-    results_df, _placements_df = compute_final_results(judge_scores)
+# -----------------------
+# Admin downloads
+# -----------------------
+@app.get("/admin/round/{round_id}/download/raw_scores")
+def download_raw_scores(round_id: int, admin_password: str):
+    with db() as conn:
+        rnd = conn.execute("SELECT event_id FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
 
+    event_id, round_type, scores_df, _comps = load_round_scores(round_id)
+    out = scores_df.copy()
+    out.insert(0, "Judge", out.index)
     buf = StringIO()
-    results_df.to_csv(buf, index=False)
+    out.to_csv(buf, index=False)
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="event_{event_id}_results.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="round_{round_id}_raw_scores.csv"'},
     )
 
 
-@app.get("/admin/event/{event_id}/download/placements")
-def download_placements(event_id: int, admin_password: str):
-    require_admin(event_id, admin_password)
-    judge_scores = load_scores_dataframe(event_id)
-    _results_df, placements_df = compute_final_results(judge_scores)
+@app.get("/admin/round/{round_id}/download/placements")
+def download_placements(round_id: int, admin_password: str):
+    with db() as conn:
+        rnd = conn.execute("SELECT event_id FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
 
+    _event_id, _round_type, scores_df, _comps = load_round_scores(round_id)
+    scores = scores_df.apply(pd.to_numeric, errors="coerce")
+    placements_rows = {}
+    for j in scores.index:
+        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        placements_rows[j] = scores_to_placements(row)
+    placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
     out = placements_df.copy()
     out.insert(0, "Judge", out.index)
     buf = StringIO()
@@ -526,7 +936,80 @@ def download_placements(event_id: int, admin_password: str):
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="event_{event_id}_judge_placements.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="round_{round_id}_placements.csv"'},
+    )
+
+
+@app.get("/admin/round/{round_id}/download/final_results")
+def download_final_results(round_id: int, admin_password: str):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
+        if rnd["round_type"] != "final":
+            raise HTTPException(400, "Not a final round.")
+
+    event_id, _rt, scores_df, comps_df = load_round_scores(round_id)
+    bib_to_name = dict(zip(comps_df["Bib"].astype(str), comps_df["Competitor"].astype(str)))
+
+    scores = scores_df.apply(pd.to_numeric, errors="coerce")
+    placements_rows = {}
+    for j in scores.index:
+        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        placements_rows[j] = scores_to_placements(row)
+    placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
+
+    final_df = skating_rank(placements_df)
+    judges = list(placements_df.index)
+
+    out_rows = []
+    for _, r in final_df.iterrows():
+        bib = str(r["Bib"])
+        marks = [int(placements_df.loc[j, bib]) for j in judges]
+        out_rows.append(
+            {
+                "Place": int(r["Place"]),
+                "Competitor": bib_to_name.get(bib, ""),
+                **{j: int(placements_df.loc[j, bib]) for j in judges},
+                "BIB": bib,
+                "Marks Sorted": "-".join(str(x) for x in sorted(marks)),
+            }
+        )
+
+    out = pd.DataFrame(out_rows)
+    buf = StringIO()
+    out.to_csv(buf, index=False)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="round_{round_id}_final_results.csv"'},
+    )
+
+
+@app.get("/admin/round/{round_id}/download/prelim_summary")
+def download_prelim_summary(round_id: int, admin_password: str):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        require_admin(int(rnd["event_id"]), admin_password)
+        if rnd["round_type"] != "prelim":
+            raise HTTPException(400, "Not a prelim round.")
+
+    _event_id, _rt, scores_df, comps_df = load_round_scores(round_id)
+    bib_to_name = dict(zip(comps_df["Bib"].astype(str), comps_df["Competitor"].astype(str)))
+    y = int(rnd["yes_count"] or 0)
+    a = int(rnd["alt_count"] or 0)
+
+    _placements_df, _points_df, summary_df = compute_prelim_callback(scores_df, y, a)
+    summary_df.insert(0, "Competitor", [bib_to_name.get(str(b), "") for b in summary_df["Bib"].astype(str)])
+    buf = StringIO()
+    summary_df.to_csv(buf, index=False)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="round_{round_id}_prelim_summary.csv"'},
     )
 
 
@@ -540,7 +1023,7 @@ def judge_home():
       <form method="post" action="/judge/join">
         <div class="row">
           <input name="judge_name" placeholder="Your name" required />
-          <input name="join_code" placeholder="Join code" required />
+          <input name="join_code" placeholder="Join code (4 chars)" required />
         </div>
         <button type="submit">Join Event</button>
       </form>
@@ -556,12 +1039,9 @@ def judge_join(judge_name: str = Form(...), join_code: str = Form(...)):
     join_code = join_code.strip().upper()
 
     with db() as conn:
-        event = conn.execute("SELECT id, locked FROM events WHERE join_code=?", (join_code,)).fetchone()
+        event = conn.execute("SELECT id FROM events WHERE join_code=?", (join_code,)).fetchone()
         if not event:
             return page("Judge", '<div class="card"><p class="danger">Invalid join code.</p></div>')
-
-        if event["locked"]:
-            return page("Judge", '<div class="card"><p class="danger">This event is locked. No submissions allowed.</p></div>')
 
         token = secrets.token_urlsafe(16)
 
@@ -575,8 +1055,8 @@ def judge_join(judge_name: str = Form(...), join_code: str = Form(...)):
             conn.execute("UPDATE judges SET judge_token=? WHERE id=?", (token, judge_id))
         else:
             conn.execute(
-                "INSERT INTO judges(event_id, judge_name, judge_token) VALUES(?,?,?)",
-                (event["id"], judge_name, token),
+                "INSERT INTO judges(event_id, judge_name, judge_token, created_at) VALUES(?,?,?,?)",
+                (event["id"], judge_name, token, datetime.utcnow().isoformat()),
             )
             judge_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
@@ -588,76 +1068,152 @@ def judge_event(event_id: int, judge_id: int, token: str):
     judge = require_judge(event_id, judge_id, token)
 
     with db() as conn:
-        event = conn.execute("SELECT name, locked FROM events WHERE id=?", (event_id,)).fetchone()
+        event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
         if not event:
             raise HTTPException(404, "Event not found.")
 
-        if event["locked"]:
-            return page("Judge", '<div class="card"><p class="danger">This event is locked. Submissions are closed.</p></div>')
+        rounds = conn.execute(
+            "SELECT * FROM rounds WHERE event_id=? ORDER BY id DESC",
+            (event_id,),
+        ).fetchall()
 
-        bibs = [r["bib"] for r in conn.execute(
-            "SELECT bib FROM competitors WHERE event_id=? ORDER BY bib", (event_id,)
-        ).fetchall()]
-
-        if not bibs:
-            return page("Judge", '<div class="card">No bibs posted yet. Check back soon.</div>')
-
-        existing_scores: Dict[str, int] = {}
-        for b in bibs:
-            m = conn.execute(
-                "SELECT score FROM marks WHERE event_id=? AND judge_id=? AND bib=?",
-                (event_id, judge_id, b),
-            ).fetchone()
-            existing_scores[str(b)] = 0 if (m is None or m["score"] is None) else int(m["score"])
-
+    # show rounds and whether judge already submitted
     rows = ""
-    for b in bibs:
-        val = int(existing_scores.get(str(b), 0))
+    for r in rounds:
+        submitted = judge_has_submitted(int(r["id"]), judge_id)
+        disabled = "🔒" if r["locked"] else ("✅ Submitted" if submitted else "🟢 Open")
+        link = "" if (r["locked"] or submitted) else f'<a href="/judge/round/{r["id"]}?judge_id={judge_id}&token={token}">Open</a>'
+        typ = "Final" if r["round_type"] == "final" else f"Prelim (Y={r['yes_count']}, A={r['alt_count']})"
         rows += f"""
-        <tr data-bib="{b}">
-          <td>{b}</td>
-          <td style="min-width:280px;">
-            <input type="range" min="0" max="100" step="1" name="s__{b}" value="{val}" oninput="syncVal(this)">
-            <span class="score-pill">{val}</span>
-          </td>
+        <tr>
+          <td>{r["round_name"]}</td>
+          <td>{typ}</td>
+          <td>{disabled}</td>
+          <td>{link}</td>
         </tr>
         """
+    if not rows:
+        rows = '<tr><td colspan="4" class="muted">No rounds created yet.</td></tr>'
 
     body = f"""
     <div class="card">
       <p><a href="/judge">← Back</a></p>
       <h2>{event["name"]}</h2>
       <p>Judge: <b>{judge["judge_name"]}</b></p>
-      <p class="muted">Assign a unique score (0–100) to every competitor. Duplicates are blocked.</p>
+    </div>
+
+    <div class="card">
+      <h3>Select a Round</h3>
+      <table>
+        <thead><tr><th>Round</th><th>Type</th><th>Status</th><th></th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p class="muted">After you submit, you will not be able to reopen your scores for that round.</p>
+    </div>
+    """
+    return page("Judge Event", body)
+
+
+@app.get("/judge/round/{round_id}", response_class=HTMLResponse)
+def judge_round(round_id: int, judge_id: int, token: str):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        event = conn.execute("SELECT * FROM events WHERE id=?", (rnd["event_id"],)).fetchone()
+        if not event:
+            raise HTTPException(404, "Event not found.")
+
+    judge = require_judge(int(event["id"]), judge_id, token)
+
+    if rnd["locked"]:
+        return page("Judge", '<div class="card"><p class="danger">This round is locked.</p></div>')
+
+    if judge_has_submitted(round_id, judge_id):
+        return page(
+            "Judge",
+            '<div class="card"><p class="ok">Submission received. This round is now locked for you.</p></div>',
+        )
+
+    comps = load_competitors(int(event["id"]))
+    if comps.empty:
+        return page("Judge", '<div class="card"><p class="danger">No bibs posted yet.</p></div>')
+
+    # load existing scores (allowed before submission)
+    with db() as conn:
+        existing = {}
+        for b in comps["Bib"].astype(str).tolist():
+            m = conn.execute(
+                "SELECT score FROM marks WHERE round_id=? AND judge_id=? AND bib=?",
+                (round_id, judge_id, b),
+            ).fetchone()
+            existing[b] = 0 if (m is None or m["score"] is None) else int(m["score"])
+
+    y = int(rnd["yes_count"] or 0)
+    a = int(rnd["alt_count"] or 0)
+    is_prelim = rnd["round_type"] == "prelim"
+
+    rows = ""
+    for _, row in comps.iterrows():
+        bib = str(row["Bib"])
+        name = str(row["Competitor"] or "")
+        val = int(existing.get(bib, 0))
+        label = f"{bib}" if not name else f"{bib} | {name}"
+        rows += f"""
+        <tr data-bib="{bib}">
+          <td>{label}</td>
+          <td style="min-width:320px;">
+            <input type="range" min="0" max="100" step="1" name="s__{bib}" value="{val}" oninput="syncVal(this)">
+            <span class="score-pill">{val}</span>
+          </td>
+        </tr>
+        """
+
+    # JS does: duplicate detection + (prelim only) color rank bands
+    body = f"""
+    <div class="card">
+      <p><a href="/judge/event/{event["id"]}?judge_id={judge_id}&token={token}">← Back to Rounds</a></p>
+      <h2>{event["name"]} | {rnd["round_name"]}</h2>
+      <p>Judge: <b>{judge["judge_name"]}</b></p>
+      <p class="muted">
+        Sliders 0–100. Duplicate scores are not allowed.
+        {"Prelim colors: top Y green, next A yellow, rest red." if is_prelim else ""}
+      </p>
 
       <div id="dupMsg" class="muted" style="margin-bottom:10px;"></div>
 
-      <form method="post" action="/judge/event/{event_id}/submit" onsubmit="return validateBeforeSubmit();">
+      <form method="post" action="/judge/round/{round_id}/submit" onsubmit="return confirmSubmit();">
         <input type="hidden" name="judge_id" value="{judge_id}" />
         <input type="hidden" name="token" value="{token}" />
-
         <table id="scoreTable">
-          <thead><tr><th>Bib</th><th>Score</th></tr></thead>
+          <thead><tr><th>Competitor</th><th>Score</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
-
         <button id="submitBtn" type="submit" style="margin-top:12px;">Submit</button>
       </form>
     </div>
 
     <script>
+      const IS_PRELIM = {str(is_prelim).lower()};
+      const Y = {y};
+      const A = {a};
+
       function syncVal(slider) {{
         const pill = slider.parentElement.querySelector('.score-pill');
         pill.textContent = slider.value;
-        validateDuplicates();
+        validateAndColor();
       }}
 
       function validateDuplicates() {{
-        const rows = document.querySelectorAll('#scoreTable tbody tr');
+        const rows = Array.from(document.querySelectorAll('#scoreTable tbody tr'));
         const seen = new Map();
         let hasDup = false;
 
-        rows.forEach(r => r.style.background = '');
+        rows.forEach(r => {{
+          r.classList.remove('bg-green','bg-yellow','bg-red');
+          r.style.background = '';
+        }});
+
         rows.forEach(r => {{
           const slider = r.querySelector('input[type="range"]');
           const v = slider.value;
@@ -674,7 +1230,7 @@ def judge_event(event_id: int, judge_id: int, token: str):
         const btn = document.getElementById('submitBtn');
 
         if (hasDup) {{
-          msg.textContent = "Duplicate score detected. Adjust sliders so every score is unique.";
+          msg.textContent = "Duplicate score detected. Make every score unique.";
           msg.className = "danger";
           btn.disabled = true;
         }} else {{
@@ -685,66 +1241,104 @@ def judge_event(event_id: int, judge_id: int, token: str):
         return !hasDup;
       }}
 
-      function validateBeforeSubmit() {{
-        return validateDuplicates();
+      function applyPrelimColors() {{
+        if (!IS_PRELIM) return;
+
+        const rows = Array.from(document.querySelectorAll('#scoreTable tbody tr'));
+        const scored = rows.map(r => {{
+          const v = parseInt(r.querySelector('input[type="range"]').value, 10);
+          return {{ r, v }};
+        }});
+
+        // sort by score desc
+        scored.sort((a,b) => b.v - a.v);
+
+        scored.forEach((obj, idx) => {{
+          obj.r.classList.remove('bg-green','bg-yellow','bg-red');
+          if (idx < Y) obj.r.classList.add('bg-green');
+          else if (idx < Y + A) obj.r.classList.add('bg-yellow');
+          else obj.r.classList.add('bg-red');
+        }});
       }}
 
-      validateDuplicates();
+      function validateAndColor() {{
+        const ok = validateDuplicates();
+        if (ok) applyPrelimColors();
+      }}
+
+      function confirmSubmit() {{
+        const ok = validateDuplicates();
+        if (!ok) return false;
+        return confirm("Are you sure you want to submit? This action cannot be undone.");
+      }}
+
+      validateAndColor();
     </script>
     """
-    return page("Judge Scoring", body)
+    return page("Judge Round", body)
 
 
-@app.post("/judge/event/{event_id}/submit")
-async def judge_submit(event_id: int, request: Request, judge_id: int = Form(...), token: str = Form(...)):
-    _judge = require_judge(event_id, judge_id, token)
-    form = await request.form()
-
+@app.post("/judge/round/{round_id}/submit")
+async def judge_round_submit(round_id: int, request: Request, judge_id: int = Form(...), token: str = Form(...)):
     with db() as conn:
-        event = conn.execute("SELECT locked FROM events WHERE id=?", (event_id,)).fetchone()
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        event = conn.execute("SELECT * FROM events WHERE id=?", (rnd["event_id"],)).fetchone()
         if not event:
             raise HTTPException(404, "Event not found.")
-        if event["locked"]:
-            return page("Judge", '<div class="card"><p class="danger">This event is locked. Submission rejected.</p></div>')
 
-        bibs = [r["bib"] for r in conn.execute(
-            "SELECT bib FROM competitors WHERE event_id=?", (event_id,)
-        ).fetchall()]
+    _judge = require_judge(int(event["id"]), judge_id, token)
 
-        if not bibs:
-            return page("Judge", '<div class="card">No bibs posted yet.</div>')
+    if rnd["locked"]:
+        return page("Judge", '<div class="card"><p class="danger">Round locked. Submission rejected.</p></div>')
 
-        scores: Dict[str, int] = {}
-        for b in bibs:
-            key = f"s__{b}"
-            if key not in form:
-                return page("Judge Scoring", f'<div class="card"><p class="danger">Missing score for bib {b}.</p></div>')
-            try:
-                v = int(str(form[key]).strip())
-            except ValueError:
-                return page("Judge Scoring", f'<div class="card"><p class="danger">Invalid score for bib {b}.</p></div>')
-            if v < 0 or v > 100:
-                return page("Judge Scoring", f'<div class="card"><p class="danger">Score out of range for bib {b}: {v}.</p></div>')
-            scores[str(b)] = v
+    if judge_has_submitted(round_id, judge_id):
+        return page("Judge", '<div class="card"><p class="ok">Already submitted.</p></div>')
 
-        # Server-side uniqueness enforcement
-        if len(set(scores.values())) != len(scores.values()):
-            return page("Judge Scoring", '<div class="card"><p class="danger">Duplicate scores detected. All scores must be unique.</p></div>')
+    comps = load_competitors(int(event["id"]))
+    bibs = comps["Bib"].astype(str).tolist()
+    if not bibs:
+        return page("Judge", '<div class="card"><p class="danger">No bibs posted.</p></div>')
 
-        # Save scores
+    form = await request.form()
+
+    scores: Dict[str, int] = {}
+    for b in bibs:
+        key = f"s__{b}"
+        if key not in form:
+            return page("Judge", f'<div class="card"><p class="danger">Missing score for bib {b}.</p></div>')
+        try:
+            v = int(str(form[key]).strip())
+        except ValueError:
+            return page("Judge", f'<div class="card"><p class="danger">Invalid score for bib {b}.</p></div>')
+        if v < 0 or v > 100:
+            return page("Judge", f'<div class="card"><p class="danger">Score out of range for bib {b}.</p></div>')
+        scores[b] = v
+
+    # enforce no duplicates
+    if len(set(scores.values())) != len(scores.values()):
+        return page("Judge", '<div class="card"><p class="danger">Duplicate scores detected. Fix and resubmit.</p></div>')
+
+    with db() as conn:
+        # store scores
         for bib, score in scores.items():
             conn.execute(
                 """
-                INSERT INTO marks(event_id, judge_id, bib, score)
+                INSERT INTO marks(round_id, judge_id, bib, score)
                 VALUES(?,?,?,?)
-                ON CONFLICT(event_id, judge_id, bib) DO UPDATE SET score=excluded.score
+                ON CONFLICT(round_id, judge_id, bib) DO UPDATE SET score=excluded.score
                 """,
-                (event_id, judge_id, bib, score),
+                (round_id, judge_id, bib, score),
             )
 
+        # lock this judge out of this round forever
         conn.execute(
-            "UPDATE judges SET last_submit_at=? WHERE id=?",
-            (datetime.utcnow().isoformat(timespec="seconds"), judge_id),
+            """
+            INSERT INTO judge_round_submissions(round_id, judge_id, submitted_at)
+            VALUES(?,?,?)
+            """,
+            (round_id, judge_id, datetime.utcnow().isoformat(timespec="seconds")),
         )
 
-    return RedirectResponse(url=f"/judge/event/{event_id}?judge_id={judge_id}&token={token}", status_code=303)
+    return page("Submitted", '<div class="card"><p class="ok">Submitted ✅</p><p class="muted">You can’t reopen this round now.</p></div>')
