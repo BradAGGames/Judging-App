@@ -278,7 +278,7 @@ def load_round_scores(round_id: int) -> Tuple[int, str, pd.DataFrame, pd.DataFra
                     "SELECT score FROM marks WHERE round_id=? AND judge_id=? AND bib=?",
                     (round_id, j["id"], b),
                 ).fetchone()
-                row[str(b)] = None if (m is None or m["score"] is None) else int(m["score"])
+                row[str(b)] = None if (m is None or m["score"] is None) else float(m["score"])
             data[j["judge_name"]] = row
 
     scores_df = pd.DataFrame.from_dict(data, orient="index")
@@ -1179,17 +1179,20 @@ def judge_round(round_id: int, judge_id: int, token: str):
                 "SELECT score FROM marks WHERE round_id=? AND judge_id=? AND bib=?",
                 (round_id, judge_id, b),
             ).fetchone()
-            existing[b] = 0 if (m is None or m["score"] is None) else int(m["score"])
+            existing[b] = None if (m is None or m["score"] is None) else float(m["score"])
 
     y = int(rnd["yes_count"] or 0)
     a = int(rnd["alt_count"] or 0)
     is_prelim = rnd["round_type"] == "prelim"
 
     rows = ""
-    for _, row in comps.iterrows():
+    for i_row, (_idx, row) in enumerate(comps.iterrows()):
         bib = str(row["Bib"])
         name = str(row["Competitor"] or "")
-        val = int(existing.get(bib, 0))
+        val = existing.get(bib)
+        if val is None:
+            val = max(70.0, 100.0 - 0.1 * i_row)
+        val = round(float(val), 1)
         label = f"{bib}" if not name else f"{bib} | {name}"
         rows += f"""
         <tr data-bib="{bib}">
@@ -1344,7 +1347,7 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
 
     form = await request.form()
 
-    scores: Dict[str, int] = {}
+    scores: Dict[str, float] = {}
     for b in bibs:
         key = f"s__{b}"
         if key not in form:
