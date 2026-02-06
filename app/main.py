@@ -81,7 +81,7 @@ def init_db():
                 round_id INTEGER NOT NULL,
                 judge_id INTEGER NOT NULL,
                 bib TEXT NOT NULL,
-                score INTEGER,
+                score REAL,
                 PRIMARY KEY (round_id, judge_id, bib)
             );
 
@@ -225,7 +225,7 @@ def skating_rank(judge_placements: pd.DataFrame) -> pd.DataFrame:
 # -----------------------
 # Conversions
 # -----------------------
-def scores_to_placements(scores_by_bib: Dict[str, int]) -> Dict[str, int]:
+def scores_to_placements(scores_by_bib: Dict[str, float]) -> Dict[str, int]:
     ordered = sorted(scores_by_bib.items(), key=lambda kv: (-kv[1], str(kv[0])))
     placements: Dict[str, int] = {}
     for idx, (bib, _score) in enumerate(ordered, start=1):
@@ -323,7 +323,7 @@ def compute_prelim_callback(scores_df: pd.DataFrame, y: int, a: int) -> Tuple[pd
 
     for judge in scores.index:
         row = scores.loc[judge].to_dict()
-        row_clean = {str(b): int(v) for b, v in row.items()}
+        row_clean = {str(b): round(float(v), 1) for b, v in row.items()}
         if len(set(row_clean.values())) != len(row_clean.values()):
             raise ValueError(f"Judge '{judge}' has duplicate scores.")
 
@@ -340,9 +340,9 @@ def compute_prelim_callback(scores_df: pd.DataFrame, y: int, a: int) -> Tuple[pd
     summary = pd.DataFrame({"Bib": scores.columns.astype(str), "TotalPoints": [float(totals[b]) for b in scores.columns]})
     summary = summary.sort_values(by=["TotalPoints", "Bib"], ascending=[False, True], kind="mergesort").reset_index(drop=True)
 
-    # Callback rules: YES = top (y+2), Alternates next 2
-    yes_n = min(len(summary), y + 2)
-    alt_n = min(len(summary) - yes_n, 2)
+    # Callback rules: YES = top y, Alternates = next a
+    yes_n = min(len(summary), y)
+    alt_n = min(len(summary) - yes_n, a)
 
     labels = ["Y"] * yes_n + [f"A{i+1}" for i in range(alt_n)] + ["N"] * (len(summary) - yes_n - alt_n)
     summary["Callback"] = labels
@@ -782,13 +782,13 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
         return page("Compute Results", '<div class="card"><p class="danger">Missing score(s) detected.</p></div>')
 
     for j in scores.index:
-        vals = list(scores.loc[j].astype(int).values)
+        vals = [round(float(x), 1) for x in list(scores.loc[j].values)]
         if len(set(vals)) != len(vals):
             return page("Compute Results", f'<div class="card"><p class="danger">Duplicate score(s) for judge {j}.</p></div>')
 
     placements_rows = {}
     for j in scores.index:
-        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        row = {str(b): round(float(v), 1) for b, v in scores.loc[j].to_dict().items()}
         placements_rows[j] = scores_to_placements(row)
     placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
 
@@ -821,7 +821,7 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
 
         raw_rows = ""
         for j in scores.index:
-            raw_rows += "<tr>" + "".join([f"<td>{j}</td>"] + [f"<td>{int(scores.loc[j, b])}</td>" for b in scores.columns]) + "</tr>"
+            raw_rows += "<tr>" + "".join([f"<td>{j}</td>"] + [f"<td>{float(scores.loc[j, b]):.1f}</td>" for b in scores.columns]) + "</tr>"
         raw_head = "".join([f"<th>{b}</th>" for b in scores.columns])
 
         body = f"""
@@ -892,7 +892,7 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
     raw_head = "".join([f"<th>{b}</th>" for b in scores_df.columns])
     raw_rows = ""
     for j in judges:
-        raw_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(scores_df.loc[j, b])}</td>" for b in scores_df.columns]) + "</tr>"
+        raw_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{float(scores_df.loc[j, b]):.1f}</td>" for b in scores_df.columns]) + "</tr>"
 
     # (FIX) Optional: build a competitor column aligned to competitor rows if you later use placement_matrix
     # The previous crash was from inserting values sized to columns into an index-sized table.
@@ -901,7 +901,7 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
     <div class="card">
       <p><a href="/admin/round/{round_id}">← Back to Round</a></p>
       <h2>Prelim Callback Results</h2>
-      <p class="muted">YES = top {y}+2; Alternates = next 2 (A1, A2); rest N.</p>
+      <p class="muted">YES = top {y}; Alternates = next {a} (A1..A{a}); rest N.</p>
       <p>
         <a href="/admin/round/{round_id}/download/prelim_summary?admin_password={admin_password}">Download Summary CSV</a> |
         <a href="/admin/round/{round_id}/download/placements?admin_password={admin_password}">Download Placements CSV</a> |
@@ -911,14 +911,6 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
       <table>
         <thead><tr><th>Competitor</th><th>BIB</th><th>Callback</th><th>Total Points</th></tr></thead>
         <tbody>{rows_html}</tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h3>Judge Placements (Admin)</h3>
-      <table>
-        <thead><tr><th>Judge</th>{head_bibs}</tr></thead>
-        <tbody>{jxb_rows}</tbody>
       </table>
     </div>
 
@@ -968,7 +960,7 @@ def download_placements(round_id: int, admin_password: str):
     scores = scores_df.apply(pd.to_numeric, errors="coerce")
     placements_rows = {}
     for j in scores.index:
-        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        row = {str(b): round(float(v), 1) for b, v in scores.loc[j].to_dict().items()}
         placements_rows[j] = scores_to_placements(row)
     placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
     out = placements_df.copy()
@@ -998,7 +990,7 @@ def download_final_results(round_id: int, admin_password: str):
     scores = scores_df.apply(pd.to_numeric, errors="coerce")
     placements_rows = {}
     for j in scores.index:
-        row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
+        row = {str(b): round(float(v), 1) for b, v in scores.loc[j].to_dict().items()}
         placements_rows[j] = scores_to_placements(row)
     placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
 
@@ -1202,9 +1194,11 @@ def judge_round(round_id: int, judge_id: int, token: str):
         rows += f"""
         <tr data-bib="{bib}">
           <td>{label}</td>
-          <td style="min-width:320px;">
-            <input type="range" min="0" max="100" step="1" name="s__{bib}" value="{val}" oninput="syncVal(this)">
-            <span class="score-pill">{val}</span>
+          <td style="min-width:380px;">
+            <button type="button" onclick="nudge(this,-0.1)" aria-label="Decrease score">-</button>
+            <input type="range" min="70" max="100" step="0.1" name="s__{bib}" value="{val:.1f}" oninput="syncVal(this)">
+            <button type="button" onclick="nudge(this,0.1)" aria-label="Increase score">+</button>
+            <span class="score-pill">{val:.1f}</span>
           </td>
         </tr>
         """
@@ -1215,7 +1209,7 @@ def judge_round(round_id: int, judge_id: int, token: str):
       <h2>{event["name"]} | {rnd["round_name"]}</h2>
       <p>Judge: <b>{judge["judge_name"]}</b></p>
       <p class="muted">
-        Sliders 0–100. Duplicate scores are not allowed.
+        Sliders 70–100 (0.1 increments). Use +/- for fine control. Duplicate scores are not allowed.
         {"Prelim colors: top Y green, next A yellow, rest red." if is_prelim else ""}
       </p>
 
@@ -1239,9 +1233,19 @@ def judge_round(round_id: int, judge_id: int, token: str):
 
       function syncVal(slider) {{
         const pill = slider.parentElement.querySelector('.score-pill');
-        pill.textContent = slider.value;
+        pill.textContent = parseFloat(slider.value).toFixed(1);
         validateAndColor();
-      }}
+      }
+
+      function nudge(btn, delta) {
+        const slider = btn.parentElement.querySelector('input[type=\"range\"]');
+        let v = parseFloat(slider.value) + delta;
+        v = Math.min(100, Math.max(70, v));
+        slider.value = v.toFixed(1);
+        syncVal(slider);
+        validateAndColor();
+      }
+}
 
       function validateDuplicates() {{
         const rows = Array.from(document.querySelectorAll('#scoreTable tbody tr'));
@@ -1255,7 +1259,7 @@ def judge_round(round_id: int, judge_id: int, token: str):
 
         rows.forEach(r => {{
           const slider = r.querySelector('input[type="range"]');
-          const v = slider.value;
+          const v = parseFloat(slider.value).toFixed(1);
           if (seen.has(v)) {{
             hasDup = true;
             r.style.background = '#ffe5e5';
@@ -1285,7 +1289,7 @@ def judge_round(round_id: int, judge_id: int, token: str):
 
         const rows = Array.from(document.querySelectorAll('#scoreTable tbody tr'));
         const scored = rows.map(r => {{
-          const v = parseInt(r.querySelector('input[type="range"]').value, 10);
+          const v = parseFloat(r.querySelector('input[type="range"]').value);
           return {{ r, v }};
         }});
 
@@ -1347,12 +1351,13 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
         if key not in form:
             return page("Judge", f'<div class="card"><p class="danger">Missing score for bib {b}.</p></div>')
         try:
-            v = int(str(form[key]).strip())
+            v = float(str(form[key]).strip())
         except ValueError:
             return page("Judge", f'<div class="card"><p class="danger">Invalid score for bib {b}.</p></div>')
-        if v < 0 or v > 100:
+        v = round(float(v), 1)
+        if v < 70.0 or v > 100.0:
             return page("Judge", f'<div class="card"><p class="danger">Score out of range for bib {b}.</p></div>')
-        scores[b] = v
+        scores[b] = float(v)
 
     if len(set(scores.values())) != len(scores.values()):
         return page("Judge", '<div class="card"><p class="danger">Duplicate scores detected. Fix and resubmit.</p></div>')
