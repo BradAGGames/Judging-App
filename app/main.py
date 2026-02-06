@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime
@@ -144,6 +145,7 @@ def page(title: str, body: str) -> HTMLResponse:
           .bg-green {{ background: #e7f6ea; }}
           .bg-yellow {{ background: #fff7df; }}
           .bg-red {{ background: #ffe5e5; }}
+          code {{ background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }}
         </style>
       </head>
       <body>
@@ -244,7 +246,7 @@ def load_competitors(event_id: int) -> pd.DataFrame:
     )
 
 
-def load_round_scores(round_id: int) -> Tuple[int, int, pd.DataFrame, pd.DataFrame]:
+def load_round_scores(round_id: int) -> Tuple[int, str, pd.DataFrame, pd.DataFrame]:
     """
     Returns: event_id, round_type, scores_df(rows=judge, cols=bib), competitors_df(Bib, Competitor)
     """
@@ -282,12 +284,6 @@ def load_round_scores(round_id: int) -> Tuple[int, int, pd.DataFrame, pd.DataFra
     scores_df = pd.DataFrame.from_dict(data, orient="index")
     scores_df = scores_df[[str(b) for b in bibs]]
     return event_id, round_type, scores_df, comps
-
-
-def round_is_locked(round_id: int) -> bool:
-    with db() as conn:
-        rnd = conn.execute("SELECT locked FROM rounds WHERE id=?", (round_id,)).fetchone()
-    return bool(rnd and rnd["locked"])
 
 
 def judge_has_submitted(round_id: int, judge_id: int) -> bool:
@@ -351,6 +347,63 @@ def compute_prelim_callback(scores_df: pd.DataFrame, y: int, a: int) -> Tuple[pd
     labels = ["Y"] * yes_n + [f"A{i+1}" for i in range(alt_n)] + ["N"] * (len(summary) - yes_n - alt_n)
     summary["Callback"] = labels
     return placements_df, points_df, summary
+
+
+# -----------------------
+# Bib parsing (NEW)
+# -----------------------
+def parse_bib_entries(text: str) -> List[Tuple[str, str]]:
+    """
+    Accepts:
+      - "101 Brad, 102 Jaden, 103 Ryan"
+      - one per line
+      - bib only
+      - "101 | Brad"
+    Strategy:
+      Split into candidate chunks by newlines or commas.
+      For each chunk:
+        - if contains '|': bib | name
+        - else: first token is bib, rest is name (optional)
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+
+    # split by newline or comma
+    chunks = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        chunks.extend(parts)
+
+    parsed: List[Tuple[str, str]] = []
+    for chunk in chunks:
+        if not chunk:
+            continue
+
+        if "|" in chunk:
+            left, right = chunk.split("|", 1)
+            bib = left.strip()
+            name = right.strip()
+        else:
+            # first token is bib (allow "219/210" too)
+            m = re.match(r"^\s*([^\s]+)\s*(.*)$", chunk)
+            if not m:
+                continue
+            bib = (m.group(1) or "").strip()
+            name = (m.group(2) or "").strip()
+
+        if bib:
+            parsed.append((bib, name))
+
+    # dedupe by bib, keep first name encountered
+    seen: Dict[str, str] = {}
+    for bib, name in parsed:
+        if bib not in seen:
+            seen[bib] = name
+    return list(seen.items())
 
 
 # -----------------------
@@ -468,7 +521,7 @@ def admin_event(event_id: int):
     for c in comps:
         comps_rows += f"<tr><td>{c['bib']}</td><td>{c['competitor_name'] or ''}</td></tr>"
     if not comps_rows:
-        comps_rows = '<tr><td colspan="2" class="muted">No bibs yet.</td></tr>'
+        comps_rows = '<tr><td colspan="2" class="muted">No competitors yet.</td></tr>'
 
     judges_list = ", ".join([j["judge_name"] for j in judges]) if judges else "(none yet)"
 
@@ -492,33 +545,55 @@ def admin_event(event_id: int):
         <div class="row">
           <input name="admin_password" placeholder="Admin password" type="password" required />
           <input name="round_name" placeholder="Round name (e.g., Prelims / Finals)" required />
-          <select name="round_type" required>
+          <select id="roundType" name="round_type" required onchange="togglePrelimFields()">
             <option value="final">Final (Skating)</option>
             <option value="prelim">Prelim (Callback)</option>
           </select>
         </div>
 
-        <div class="row">
-          <input name="yes_count" placeholder="Prelim YES count (Y) e.g., 7" type="number" min="1" />
-          <input name="alt_count" placeholder="Prelim ALT count (A) e.g., 3" type="number" min="0" />
+        <div id="prelimFields" style="display:none; margin-top:12px;">
+          <div class="row">
+            <input name="yes_count" placeholder="Prelim YES count (Y) e.g., 7" type="number" min="1" />
+            <input name="alt_count" placeholder="Prelim ALT count (A) e.g., 3" type="number" min="0" />
+          </div>
+          <p class="muted">These fields only apply to Prelim rounds.</p>
         </div>
 
-        <button type="submit">Create Round</button>
-        <p class="muted">For Final rounds, Y/A are ignored.</p>
+        <button type="submit" style="margin-top:12px;">Create Round</button>
       </form>
+
+      <script>
+        function togglePrelimFields() {{
+          const rt = document.getElementById('roundType').value;
+          const box = document.getElementById('prelimFields');
+          box.style.display = (rt === 'prelim') ? 'block' : 'none';
+        }}
+        togglePrelimFields();
+      </script>
     </div>
 
     <div class="card">
-      <h3>Bibs (optional names)</h3>
+      <h3>Competitors (bibs + optional names)</h3>
       <form method="post" action="/admin/event/{event_id}/set_bibs">
         <div class="row">
           <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
-        <textarea name="bibs" rows="7" placeholder="One per line. Formats:
-219/210 | Jordan Frisbee and Elizabeth Spann
-966/220 | Jesse Lopez and Tatiana Mollmann
-(or just a bib with no name)"></textarea>
-        <button type="submit">Save Bibs</button>
+        <textarea name="bibs" rows="7" placeholder="Accepted formats:
+
+101 Brad Gallow, 102 Jaden Pfeiffer, 103 Ryan Pflumm
+
+or one per line:
+101 Brad Gallow
+102 Jaden Pfeiffer
+
+or bib-only:
+101
+102
+103
+
+or pipe:
+101 | Brad Gallow"></textarea>
+        <button type="submit">Save Competitors</button>
       </form>
 
       <table style="margin-top:12px;">
@@ -544,7 +619,6 @@ def admin_event(event_id: int):
 def admin_delete_event(event_id: int, admin_password: str = Form(...)):
     require_admin(event_id, admin_password)
     with db() as conn:
-        # delete in dependency order
         round_ids = [r["id"] for r in conn.execute("SELECT id FROM rounds WHERE event_id=?", (event_id,)).fetchall()]
         for rid in round_ids:
             conn.execute("DELETE FROM marks WHERE round_id=?", (rid,))
@@ -578,9 +652,6 @@ def admin_create_round(
             raise HTTPException(400, "Prelim requires YES count (Y) >= 1.")
         if a is None or a < 0:
             raise HTTPException(400, "Prelim requires ALT count (A) >= 0.")
-        if a > 10:
-            # soft cap; you said max 5 recommended, but we won't hard-fail at 6+
-            a = a
 
     with db() as conn:
         conn.execute(
@@ -598,31 +669,14 @@ def admin_create_round(
 def admin_set_bibs(event_id: int, admin_password: str = Form(...), bibs: str = Form("")):
     require_admin(event_id, admin_password)
 
-    lines = [ln.strip() for ln in bibs.replace(",", "\n").splitlines() if ln.strip()]
-    parsed: List[Tuple[str, str]] = []
-    for ln in lines:
-        if "|" in ln:
-            left, right = ln.split("|", 1)
-            bib = left.strip()
-            name = right.strip()
-        else:
-            bib = ln.strip()
-            name = ""
-        parsed.append((bib, name))
-
-    # dedupe by bib, keep first name encountered
-    seen = {}
-    for bib, name in parsed:
-        if bib not in seen:
-            seen[bib] = name
-    bib_list = list(seen.items())
+    bib_list = parse_bib_entries(bibs)
 
     with db() as conn:
         conn.execute("DELETE FROM competitors WHERE event_id=?", (event_id,))
         for bib, name in bib_list:
             conn.execute(
                 "INSERT OR IGNORE INTO competitors(event_id, bib, competitor_name) VALUES(?,?,?)",
-                (event_id, str(bib), name or None),
+                (event_id, str(bib), (name or None)),
             )
     return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
 
@@ -692,7 +746,7 @@ def admin_round(round_id: int):
         <a href="/admin/round/{round_id}/download/raw_scores?admin_password=__PW__">Raw scores CSV</a> |
         <a href="/admin/round/{round_id}/download/placements?admin_password=__PW__">Placements CSV</a>
       </p>
-      <p class="muted">Tip: replace __PW__ with your admin password after computing if you want quick links.</p>
+      <p class="muted">Tip: replace <code>__PW__</code> with your admin password after computing if you want quick links.</p>
     </div>
     """
     return page("Admin Round", body)
@@ -723,33 +777,25 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
     except Exception as e:
         return page("Compute Results", f'<div class="card"><p class="danger">Error:</p><pre>{e}</pre></div>')
 
-    # Validate completeness + uniqueness per judge
     scores = scores_df.apply(pd.to_numeric, errors="coerce")
     if scores.isna().any().any():
         return page("Compute Results", '<div class="card"><p class="danger">Missing score(s) detected.</p></div>')
+
     for j in scores.index:
         vals = list(scores.loc[j].astype(int).values)
         if len(set(vals)) != len(vals):
             return page("Compute Results", f'<div class="card"><p class="danger">Duplicate score(s) for judge {j}.</p></div>')
 
-    # Compute placements matrix
     placements_rows = {}
     for j in scores.index:
         row = {str(b): int(v) for b, v in scores.loc[j].to_dict().items()}
         placements_rows[j] = scores_to_placements(row)
     placements_df = pd.DataFrame.from_dict(placements_rows, orient="index")[scores.columns]
 
-    # Admin raw scores view
-    raw_scores_df = scores.copy()
-    raw_scores_df.insert(0, "Judge", raw_scores_df.index)
-
-    # Join bib->name
     bib_to_name = dict(zip(comps_df["Bib"].astype(str), comps_df["Competitor"].astype(str)))
 
     if round_type == "final":
-        # Skating final
         final_df = skating_rank(placements_df)
-        # Build display table like your screenshot
         judges = list(placements_df.index)
 
         rows_html = ""
@@ -773,7 +819,6 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
 
         head_judges = "".join(f"<th>{j}</th>" for j in judges)
 
-        # Raw scores table
         raw_rows = ""
         for j in scores.index:
             raw_rows += "<tr>" + "".join([f"<td>{j}</td>"] + [f"<td>{int(scores.loc[j, b])}</td>" for b in scores.columns]) + "</tr>"
@@ -822,7 +867,6 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
     except Exception as e:
         return page("Prelim Results", f'<div class="card"><p class="danger">Error:</p><pre>{e}</pre></div>')
 
-    # Display summary table
     rows_html = ""
     for _, r in summary_df.iterrows():
         bib = str(r["Bib"])
@@ -836,24 +880,22 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
         </tr>
         """
 
-    # Raw scores + per-judge placement/points tables (admin can see)
     judges = list(scores_df.index)
 
-    # Per-judge placement/points table per competitor (like a matrix)
-    placement_matrix = placements_df2.copy()
-    placement_matrix.insert(0, "Competitor", [bib_to_name.get(str(b), "") for b in placement_matrix.columns])
-    # too wide for html with competitor as col; we'll show judge x bib table
-    # Build judge x bib placement
+    # Judge x bib placement table
+    head_bibs = "".join([f"<th>{b}</th>" for b in placements_df2.columns])
     jxb_rows = ""
     for j in judges:
         jxb_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(placements_df2.loc[j, b])}</td>" for b in placements_df2.columns]) + "</tr>"
-    head_bibs = "".join([f"<th>{b}</th>" for b in placements_df2.columns])
 
-    # raw scores judge x bib
+    # Raw scores judge x bib
+    raw_head = "".join([f"<th>{b}</th>" for b in scores_df.columns])
     raw_rows = ""
     for j in judges:
         raw_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(scores_df.loc[j, b])}</td>" for b in scores_df.columns]) + "</tr>"
-    raw_head = "".join([f"<th>{b}</th>" for b in scores_df.columns])
+
+    # (FIX) Optional: build a competitor column aligned to competitor rows if you later use placement_matrix
+    # The previous crash was from inserting values sized to columns into an index-sized table.
 
     body = f"""
     <div class="card">
@@ -902,7 +944,7 @@ def download_raw_scores(round_id: int, admin_password: str):
             raise HTTPException(404, "Round not found.")
         require_admin(int(rnd["event_id"]), admin_password)
 
-    event_id, round_type, scores_df, _comps = load_round_scores(round_id)
+    _event_id, _round_type, scores_df, _comps = load_round_scores(round_id)
     out = scores_df.copy()
     out.insert(0, "Judge", out.index)
     buf = StringIO()
@@ -950,7 +992,7 @@ def download_final_results(round_id: int, admin_password: str):
         if rnd["round_type"] != "final":
             raise HTTPException(400, "Not a final round.")
 
-    event_id, _rt, scores_df, comps_df = load_round_scores(round_id)
+    _event_id, _rt, scores_df, comps_df = load_round_scores(round_id)
     bib_to_name = dict(zip(comps_df["Bib"].astype(str), comps_df["Competitor"].astype(str)))
 
     scores = scores_df.apply(pd.to_numeric, errors="coerce")
@@ -1077,7 +1119,6 @@ def judge_event(event_id: int, judge_id: int, token: str):
             (event_id,),
         ).fetchall()
 
-    # show rounds and whether judge already submitted
     rows = ""
     for r in rounds:
         submitted = judge_has_submitted(int(r["id"]), judge_id)
@@ -1137,9 +1178,8 @@ def judge_round(round_id: int, judge_id: int, token: str):
 
     comps = load_competitors(int(event["id"]))
     if comps.empty:
-        return page("Judge", '<div class="card"><p class="danger">No bibs posted yet.</p></div>')
+        return page("Judge", '<div class="card"><p class="danger">No competitors posted yet.</p></div>')
 
-    # load existing scores (allowed before submission)
     with db() as conn:
         existing = {}
         for b in comps["Bib"].astype(str).tolist():
@@ -1169,7 +1209,6 @@ def judge_round(round_id: int, judge_id: int, token: str):
         </tr>
         """
 
-    # JS does: duplicate detection + (prelim only) color rank bands
     body = f"""
     <div class="card">
       <p><a href="/judge/event/{event["id"]}?judge_id={judge_id}&token={token}">← Back to Rounds</a></p>
@@ -1250,7 +1289,6 @@ def judge_round(round_id: int, judge_id: int, token: str):
           return {{ r, v }};
         }});
 
-        // sort by score desc
         scored.sort((a,b) => b.v - a.v);
 
         scored.forEach((obj, idx) => {{
@@ -1299,7 +1337,7 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
     comps = load_competitors(int(event["id"]))
     bibs = comps["Bib"].astype(str).tolist()
     if not bibs:
-        return page("Judge", '<div class="card"><p class="danger">No bibs posted.</p></div>')
+        return page("Judge", '<div class="card"><p class="danger">No competitors posted.</p></div>')
 
     form = await request.form()
 
@@ -1316,12 +1354,10 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
             return page("Judge", f'<div class="card"><p class="danger">Score out of range for bib {b}.</p></div>')
         scores[b] = v
 
-    # enforce no duplicates
     if len(set(scores.values())) != len(scores.values()):
         return page("Judge", '<div class="card"><p class="danger">Duplicate scores detected. Fix and resubmit.</p></div>')
 
     with db() as conn:
-        # store scores
         for bib, score in scores.items():
             conn.execute(
                 """
@@ -1332,7 +1368,6 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
                 (round_id, judge_id, bib, score),
             )
 
-        # lock this judge out of this round forever
         conn.execute(
             """
             INSERT INTO judge_round_submissions(round_id, judge_id, submitted_at)
