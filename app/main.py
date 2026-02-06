@@ -1235,17 +1235,16 @@ def judge_round(round_id: int, judge_id: int, token: str):
         const pill = slider.parentElement.querySelector('.score-pill');
         pill.textContent = parseFloat(slider.value).toFixed(1);
         validateAndColor();
-      }
+      }}
 
-      function nudge(btn, delta) {
-        const slider = btn.parentElement.querySelector('input[type=\"range\"]');
+      function nudge(btn, delta) {{
+        const slider = btn.parentElement.querySelector('input[type="range"]');
         let v = parseFloat(slider.value) + delta;
         v = Math.min(100, Math.max(70, v));
         slider.value = v.toFixed(1);
         syncVal(slider);
         validateAndColor();
-      }
-}
+      }}
 
       function validateDuplicates() {{
         const rows = Array.from(document.querySelectorAll('#scoreTable tbody tr'));
