@@ -57,6 +57,12 @@ def init_db():
                 UNIQUE(event_id, bib)
             );
 
+            CREATE TABLE IF NOT EXISTS round_competitors (
+                round_id INTEGER NOT NULL,
+                bib TEXT NOT NULL,
+                PRIMARY KEY (round_id, bib)
+            );
+
             CREATE TABLE IF NOT EXISTS rounds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id INTEGER NOT NULL,
@@ -246,6 +252,40 @@ def load_competitors(event_id: int) -> pd.DataFrame:
     )
 
 
+
+
+def load_competitors_for_round(round_id: int) -> Tuple[int, pd.DataFrame]:
+    """Return (event_id, competitors_df) for a round.
+
+    If round_competitors has rows for this round, use only those bibs (names pulled from event competitors table).
+    Otherwise, fall back to all event competitors.
+    """
+    with db() as conn:
+        rnd = conn.execute("SELECT event_id FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise ValueError("Round not found.")
+        event_id = int(rnd["event_id"])
+        rc = conn.execute(
+            "SELECT bib FROM round_competitors WHERE round_id=? ORDER BY bib",
+            (round_id,),
+        ).fetchall()
+
+        if not rc:
+            return event_id, load_competitors(event_id)
+
+        bibs = [str(r["bib"]) for r in rc]
+        # pull names from event competitors
+        rows = conn.execute(
+            "SELECT bib, competitor_name FROM competitors WHERE event_id=? AND bib IN (%s) ORDER BY bib"
+            % (",".join(["?"] * len(bibs))),
+            (event_id, *bibs),
+        ).fetchall()
+
+    # ensure we preserve the round-specific ordering and include blank names if missing
+    name_map = {str(r["bib"]): (r["competitor_name"] or "") for r in rows}
+    return event_id, pd.DataFrame({"Bib": bibs, "Competitor": [name_map.get(b, "") for b in bibs]})
+
+
 def load_round_scores(round_id: int) -> Tuple[int, str, pd.DataFrame, pd.DataFrame]:
     """
     Returns: event_id, round_type, scores_df(rows=judge, cols=bib), competitors_df(Bib, Competitor)
@@ -257,7 +297,8 @@ def load_round_scores(round_id: int) -> Tuple[int, str, pd.DataFrame, pd.DataFra
         event_id = int(rnd["event_id"])
         round_type = rnd["round_type"]
 
-        comps = load_competitors(event_id)
+        event_id2, comps = load_competitors_for_round(round_id)
+        event_id = event_id2
         bibs = comps["Bib"].astype(str).tolist()
 
         judges = conn.execute(
@@ -765,7 +806,12 @@ def admin_toggle_round_lock(round_id: int, admin_password: str = Form(...)):
 
 
 @app.post("/admin/round/{round_id}/compute", response_class=HTMLResponse)
-def admin_compute_round(round_id: int, admin_password: str = Form(...)):
+def admin_compute_round(
+    round_id: int,
+    admin_password: str = Form(...),
+    yes_override: Optional[int] = Form(None),
+    alt_override: Optional[int] = Form(None),
+):
     with db() as conn:
         rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
@@ -845,11 +891,54 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
               </tr>
             </thead>
             <tbody>{rows_html}</tbody>
-          </table>
-        </div>
+          
+      </table>
+    </div>
 
-        <div class="card">
-          <h3>Raw Scores (Admin Only)</h3>
+    <div class="card">
+      <h3>Adjust Recall Cut (Admin)</h3>
+      <form method="post" action="/admin/round/{round_id}/compute">
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+          <input name="yes_override" placeholder="YES (Y)" type="number" min="1" value="{y}" required />
+          <input name="alt_override" placeholder="Alternates (A)" type="number" min="0" value="{a}" required />
+        </div>
+        <button type="submit">Recompute with New Cut</button>
+        <p class="muted">This updates the round’s Y/A cut and recomputes labels and points. Judges’ raw scores stay unchanged.</p>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Create Finals from Promoted (Admin)</h3>
+      <form method="post" action="/admin/round/{round_id}/create_final_from_yes" onsubmit="return confirm('Create a new Final round using only the Y-promoted bibs?');">
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+          <input name="final_round_name" placeholder="Final round name" value="Finals (Auto)" />
+        </div>
+        <button type="submit">Create Final from Y</button>
+        <p class="muted">Creates a new Final round and limits its competitor list to the Y-promoted dancers.</p>
+      </form>
+    </div>
+
+    <div class="card">
+      <h3>Judge Breakdown (Y / A / N)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Competitor</th>
+            {detail_head_judges}
+            <th>BIB</th>
+            <th>Counts (Y-A-N)</th>
+          </tr>
+        </thead>
+        <tbody>{detail_rows}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Raw Scores (Admin Only)</h3>
+
           <table>
             <thead><tr><th>Judge</th>{raw_head}</tr></thead>
             <tbody>{raw_rows}</tbody>
@@ -859,9 +948,13 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
         return page("Final Results", body)
 
     # Prelim callback
-    y = int(rnd["yes_count"] or 0)
-    a = int(rnd["alt_count"] or 0)
+    y = int(yes_override) if yes_override is not None and str(yes_override) != "" else int(rnd["yes_count"] or 0)
+    a = int(alt_override) if alt_override is not None and str(alt_override) != "" else int(rnd["alt_count"] or 0)
 
+    # If admin provided overrides, persist them to the round so future computes use the new cut
+    if yes_override is not None or alt_override is not None:
+        with db() as conn:
+            conn.execute("UPDATE rounds SET yes_count=?, alt_count=? WHERE id=?", (y, a, round_id))
     try:
         placements_df2, points_df, summary_df = compute_prelim_callback(scores_df, y, a)
     except Exception as e:
@@ -881,14 +974,47 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
         """
 
     judges = list(scores_df.index)
+    # Judge Y/A/N breakdown (competitor rows, judge columns)
+    def _rank_to_label(rank: int) -> str:
+        if rank <= y:
+            return "Y"
+        if rank <= y + a:
+            return f"A{rank - y}"
+        return "N"
 
-    # Judge x bib placement table
-    head_bibs = "".join([f"<th>{b}</th>" for b in placements_df2.columns])
-    jxb_rows = ""
-    for j in judges:
-        jxb_rows += "<tr><td>" + j + "</td>" + "".join([f"<td>{int(placements_df2.loc[j, b])}</td>" for b in placements_df2.columns]) + "</tr>"
+    detail_rows = ""
+    # use summary order (best to worst) for rows
+    for idx_row, r in summary_df.iterrows():
+        bib = str(r["Bib"])
+        comp_name = bib_to_name.get(bib, "")
+        per_j = []
+        y_count = a_count = n_count = 0
+        for j in judges:
+            rk = int(placements_df2.loc[j, bib])
+            lab = _rank_to_label(rk)
+            if lab == "Y":
+                y_count += 1
+            elif lab.startswith("A"):
+                a_count += 1
+            else:
+                n_count += 1
+            per_j.append(lab)
+        counts_str = f"{y_count}-{a_count}-{n_count}"
+        judge_cells = "".join([f"<td>{lab}</td>" for lab in per_j])
+        detail_rows += f"""
+        <tr>
+          <td>{idx_row+1}</td>
+          <td>{comp_name}</td>
+          {judge_cells}
+          <td>{bib}</td>
+          <td>{counts_str}</td>
+        </tr>
+        """
+
+    detail_head_judges = "".join([f"<th>{j}</th>" for j in judges])
 
     # Raw scores judge x bib
+
     raw_head = "".join([f"<th>{b}</th>" for b in scores_df.columns])
     raw_rows = ""
     for j in judges:
@@ -923,6 +1049,60 @@ def admin_compute_round(round_id: int, admin_password: str = Form(...)):
     </div>
     """
     return page("Prelim Results", body)
+
+
+
+@app.post("/admin/round/{round_id}/create_final_from_yes")
+def admin_create_final_from_yes(
+    round_id: int,
+    admin_password: str = Form(...),
+    final_round_name: str = Form("Finals (Auto)"),
+):
+    with db() as conn:
+        rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
+        if not rnd:
+            raise HTTPException(404, "Round not found.")
+        if rnd["round_type"] != "prelim":
+            raise HTTPException(400, "This action is only for prelim rounds.")
+        event_id = int(rnd["event_id"])
+        require_admin(event_id, admin_password)
+
+    # Compute current prelim results to determine Y promotions
+    _event_id, _rt, scores_df, _comps_df = load_round_scores(round_id)
+    y = int(rnd["yes_count"] or 0)
+    a = int(rnd["alt_count"] or 0)
+
+    _placements_df, _points_df, summary_df = compute_prelim_callback(scores_df, y, a)
+    promoted = [str(b) for b in summary_df.loc[summary_df["Callback"] == "Y", "Bib"].astype(str).tolist()]
+    if not promoted:
+        return page("Create Final", '<div class="card"><p class="danger">No promoted (Y) bibs found.</p></div>')
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO rounds(event_id, round_name, round_type, yes_count, alt_count, locked, created_at)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                event_id,
+                (final_round_name.strip() or "Finals (Auto)"),
+                "final",
+                None,
+                None,
+                0,
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        new_round_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+        # Limit the new final to promoted competitors
+        for bib in promoted:
+            conn.execute(
+                "INSERT OR IGNORE INTO round_competitors(round_id, bib) VALUES(?,?)",
+                (new_round_id, bib),
+            )
+
+    return RedirectResponse(url=f"/admin/round/{new_round_id}", status_code=303)
 
 
 # -----------------------
@@ -1168,7 +1348,9 @@ def judge_round(round_id: int, judge_id: int, token: str):
             '<div class="card"><p class="ok">Submission received. This round is now locked for you.</p></div>',
         )
 
-    comps = load_competitors(int(event["id"]))
+    event_id2, comps = load_competitors_for_round(round_id)
+    # event_id2 should match event['id']
+
     if comps.empty:
         return page("Judge", '<div class="card"><p class="danger">No competitors posted yet.</p></div>')
 
@@ -1340,7 +1522,8 @@ async def judge_round_submit(round_id: int, request: Request, judge_id: int = Fo
     if judge_has_submitted(round_id, judge_id):
         return page("Judge", '<div class="card"><p class="ok">Already submitted.</p></div>')
 
-    comps = load_competitors(int(event["id"]))
+    event_id2, comps = load_competitors_for_round(round_id)
+    
     bibs = comps["Bib"].astype(str).tolist()
     if not bibs:
         return page("Judge", '<div class="card"><p class="danger">No competitors posted.</p></div>')
