@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from typing import Dict, List, Tuple, Optional
 
@@ -47,6 +47,13 @@ def init_db():
                 join_code TEXT NOT NULL,
                 locked INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token TEXT PRIMARY KEY,
+                event_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS competitors (
@@ -113,6 +120,50 @@ def require_admin(event_id: int, admin_password: str) -> None:
             raise HTTPException(404, "Event not found.")
         if sha256(admin_password) != row["admin_pw_hash"]:
             raise HTTPException(403, "Invalid admin password.")
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+def create_admin_session(event_id: int) -> str:
+    """Create a browser-session admin token for a specific event."""
+    token = secrets.token_urlsafe(24)
+    created_at = _utc_now_iso()
+    expires_at = (datetime.utcnow().replace(microsecond=0) + timedelta(hours=12)).isoformat()
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_sessions(token, event_id, created_at, expires_at) VALUES(?,?,?,?)",
+            (token, int(event_id), created_at, expires_at),
+        )
+    return token
+
+def clear_admin_session(token: str) -> None:
+    if not token:
+        return
+    with db() as conn:
+        conn.execute("DELETE FROM admin_sessions WHERE token=?", (token,))
+
+def require_admin_session(event_id: int, request: Request) -> str:
+    """Require an existing admin session (cookie) for this event."""
+    token = request.cookies.get("admin_session") or ""
+    if not token:
+        raise HTTPException(403, "Admin session required.")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT event_id, expires_at FROM admin_sessions WHERE token=?",
+            (token,),
+        ).fetchone()
+    if not row or int(row["event_id"]) != int(event_id):
+        raise HTTPException(403, "Admin session required.")
+    try:
+        exp = datetime.fromisoformat(row["expires_at"])
+        if datetime.utcnow() > exp:
+            clear_admin_session(token)
+            raise HTTPException(403, "Admin session expired.")
+    except ValueError:
+        clear_admin_session(token)
+        raise HTTPException(403, "Admin session expired.")
+    return token
 
 
 def require_judge(event_id: int, judge_id: int, token: str) -> sqlite3.Row:
@@ -491,7 +542,6 @@ def admin_home():
       <form method="post" action="/admin/create">
         <div class="row">
           <input name="event_name" placeholder="Event name" required />
-          <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
         <button type="submit">Create</button>
       </form>
@@ -518,11 +568,36 @@ def admin_create(event_name: str = Form(...), admin_password: str = Form(...)):
             (event_name.strip(), sha256(admin_password), join_code, 0, datetime.utcnow().isoformat()),
         )
         event_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-    return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
+
+    token = create_admin_session(int(event_id))
+    resp = RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
+    resp.set_cookie("admin_session", token, httponly=True, samesite="lax")
+    return resp
 
 
 @app.get("/admin/event/{event_id}", response_class=HTMLResponse)
-def admin_event(event_id: int):
+def admin_event(event_id: int, request: Request):
+    # Require admin session for this event. If missing, prompt for password once.
+    try:
+        require_admin_session(event_id, request)
+    except HTTPException:
+        return page(
+            "Admin Login",
+            f'''
+            <div class="card">
+              <p><a href="/admin">← Back to Admin</a></p>
+              <h2>Unlock Event #{event_id}</h2>
+              <form method="post" action="/admin/event/{event_id}/login">
+                <div class="row">
+                  <input name="admin_password" placeholder="Admin password" type="password" required />
+                </div>
+                <button type="submit">Unlock</button>
+              </form>
+              <p class="muted">You’ll only need this again if you close your browser or revisit later.</p>
+            </div>
+            '''
+        )
+
     with db() as conn:
         event = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
         if not event:
@@ -565,8 +640,11 @@ def admin_event(event_id: int):
         comps_rows = '<tr><td colspan="2" class="muted">No competitors yet.</td></tr>'
 
     judges_list = ", ".join([j["judge_name"] for j in judges]) if judges else "(none yet)"
+    msg = request.query_params.get("msg") or ""
+    msg_js = msg.replace("\\", "\\\\").replace("'", "\\'")
 
     body = f"""
+    {f"<script>alert('{msg_js}');</script>" if msg_js else ""}
     <div class="card">
       <p><a href="/admin">← Back to Admin</a></p>
       <h2>{event["name"]}</h2>
@@ -616,9 +694,6 @@ def admin_event(event_id: int):
     <div class="card">
       <h3>Competitors (bibs + optional names)</h3>
       <form method="post" action="/admin/event/{event_id}/set_bibs">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-        </div>
         <textarea name="bibs" rows="7" placeholder="Accepted formats:
 
 101 Brad Gallow, 102 Jaden Pfeiffer, 103 Ryan Pflumm
@@ -635,6 +710,15 @@ or bib-only:
 or pipe:
 101 | Brad Gallow"></textarea>
         <button type="submit">Save Competitors</button>
+
+      <div class="card" style="border:none; padding:0; margin:12px 0 0 0;">
+        <h4 style="margin:10px 0 6px 0;">Add Competitors (append / update)</h4>
+        <form method="post" action="/admin/event/{event_id}/add_bibs">
+          <textarea name="bibs" rows="4" placeholder="Add new bibs (same formats). Existing bibs are kept; names update if provided."></textarea>
+          <button type="submit" style="margin-top:8px;">Add</button>
+        </form>
+      </div>
+
       </form>
 
       <table style="margin-top:12px;">
@@ -646,9 +730,6 @@ or pipe:
     <div class="card">
       <h3>Delete Event</h3>
       <form method="post" action="/admin/event/{event_id}/delete" onsubmit="return confirm('Delete this event? This deletes rounds, judges, and marks.');">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-        </div>
         <button type="submit" style="background:#ffe5e5;">Delete Event</button>
       </form>
     </div>
@@ -656,9 +737,19 @@ or pipe:
     return page(f"Admin Event #{event_id}", body)
 
 
+
+@app.post("/admin/event/{event_id}/login")
+def admin_event_login(event_id: int, admin_password: str = Form(...)):
+    require_admin_session(event_id, request)
+    token = create_admin_session(event_id)
+    resp = RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
+    resp.set_cookie("admin_session", token, httponly=True, samesite="lax")
+    return resp
+
+
 @app.post("/admin/event/{event_id}/delete")
 def admin_delete_event(event_id: int, admin_password: str = Form(...)):
-    require_admin(event_id, admin_password)
+    require_admin_session(event_id, request)
     with db() as conn:
         round_ids = [r["id"] for r in conn.execute("SELECT id FROM rounds WHERE event_id=?", (event_id,)).fetchall()]
         for rid in round_ids:
@@ -674,7 +765,7 @@ def admin_delete_event(event_id: int, admin_password: str = Form(...)):
 @app.post("/admin/event/{event_id}/create_round")
 def admin_create_round(
     event_id: int,
-    admin_password: str = Form(...),
+    request: Request,
     round_name: str = Form(...),
     round_type: str = Form(...),
     yes_count: Optional[int] = Form(None),
@@ -703,11 +794,11 @@ def admin_create_round(
             (event_id, round_name.strip(), round_type, y, a, 0, datetime.utcnow().isoformat()),
         )
         rid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-    return RedirectResponse(url=f"/admin/round/{rid}", status_code=303)
+    return RedirectResponse(url=f"/admin/event/{event_id}?msg=Round%20{round_name.strip()}%20created", status_code=303)
 
 
 @app.post("/admin/event/{event_id}/set_bibs")
-def admin_set_bibs(event_id: int, admin_password: str = Form(...), bibs: str = Form("")):
+def admin_set_bibs(event_id: int, request: Request, bibs: str = Form("")):
     require_admin(event_id, admin_password)
 
     bib_list = parse_bib_entries(bibs)
@@ -722,8 +813,32 @@ def admin_set_bibs(event_id: int, admin_password: str = Form(...), bibs: str = F
     return RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
 
 
+
+@app.post("/admin/event/{event_id}/add_bibs")
+def admin_add_bibs(event_id: int, request: Request, bibs: str = Form("")):
+    require_admin_session(event_id, request)
+    bib_list = parse_bib_entries(bibs)
+
+    with db() as conn:
+        for bib, name in bib_list:
+            conn.execute(
+                """
+                INSERT INTO competitors(event_id, bib, competitor_name)
+                VALUES(?,?,?)
+                ON CONFLICT(event_id, bib) DO UPDATE SET
+                    competitor_name = CASE
+                        WHEN excluded.competitor_name IS NULL OR excluded.competitor_name = ''
+                        THEN competitors.competitor_name
+                        ELSE excluded.competitor_name
+                    END
+                """,
+                (event_id, str(bib), (name or None)),
+            )
+    return RedirectResponse(url=f"/admin/event/{event_id}?msg=Competitors%20added", status_code=303)
+
+
 @app.get("/admin/round/{round_id}", response_class=HTMLResponse)
-def admin_round(round_id: int):
+def admin_round(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
@@ -731,6 +846,8 @@ def admin_round(round_id: int):
         event = conn.execute("SELECT * FROM events WHERE id=?", (rnd["event_id"],)).fetchone()
         if not event:
             raise HTTPException(404, "Event not found.")
+
+        require_admin_session(int(event["id"]), request)
 
         judges = conn.execute(
             "SELECT id, judge_name FROM judges WHERE event_id=? ORDER BY judge_name",
@@ -769,37 +886,30 @@ def admin_round(round_id: int):
     <div class="card">
       <h3>Controls</h3>
       <form method="post" action="/admin/round/{round_id}/toggle_lock" style="margin-bottom:12px;">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-        </div>
         <button type="submit">{'Unlock' if rnd["locked"] else 'Lock'} Round</button>
       </form>
 
       <form method="post" action="/admin/round/{round_id}/compute">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-        </div>
         <button type="submit">Compute Results</button>
       </form>
 
       <p class="muted">
         Downloads:
-        <a href="/admin/round/{round_id}/download/raw_scores?admin_password=__PW__">Raw scores CSV</a> |
-        <a href="/admin/round/{round_id}/download/placements?admin_password=__PW__">Placements CSV</a>
+        <a href="/admin/round/{round_id}/download/raw_scores">Raw scores CSV</a> |
+        <a href="/admin/round/{round_id}/download/placements">Placements CSV</a>
       </p>
-      <p class="muted">Tip: replace <code>__PW__</code> with your admin password after computing if you want quick links.</p>
     </div>
     """
     return page("Admin Round", body)
 
 
 @app.post("/admin/round/{round_id}/toggle_lock")
-def admin_toggle_round_lock(round_id: int, admin_password: str = Form(...)):
+def admin_toggle_round_lock(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT event_id, locked FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
         new_val = 0 if rnd["locked"] else 1
         conn.execute("UPDATE rounds SET locked=? WHERE id=?", (new_val, round_id))
     return RedirectResponse(url=f"/admin/round/{round_id}", status_code=303)
@@ -808,7 +918,7 @@ def admin_toggle_round_lock(round_id: int, admin_password: str = Form(...)):
 @app.post("/admin/round/{round_id}/compute", response_class=HTMLResponse)
 def admin_compute_round(
     round_id: int,
-    admin_password: str = Form(...),
+    request: Request,
     yes_override: Optional[int] = Form(None),
     alt_override: Optional[int] = Form(None),
 ):
@@ -816,7 +926,7 @@ def admin_compute_round(
         rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
 
     try:
         event_id, round_type, scores_df, comps_df = load_round_scores(round_id)
@@ -875,9 +985,9 @@ def admin_compute_round(
           <p><a href="/admin/round/{round_id}">← Back to Round</a></p>
           <h2>Final Results (Skating)</h2>
           <p>
-            <a href="/admin/round/{round_id}/download/final_results?admin_password={admin_password}">Download Results CSV</a> |
-            <a href="/admin/round/{round_id}/download/placements?admin_password={admin_password}">Download Placements CSV</a> |
-            <a href="/admin/round/{round_id}/download/raw_scores?admin_password={admin_password}">Download Raw Scores CSV</a>
+            <a href="/admin/round/{round_id}/download/final_results">Download Results CSV</a> |
+            <a href="/admin/round/{round_id}/download/placements">Download Placements CSV</a> |
+            <a href="/admin/round/{round_id}/download/raw_scores">Download Raw Scores CSV</a>
           </p>
 
           <table>
@@ -1029,9 +1139,9 @@ def admin_compute_round(
       <h2>Prelim Callback Results</h2>
       <p class="muted">YES = top {y}; Alternates = next {a} (A1..A{a}); rest N.</p>
       <p>
-        <a href="/admin/round/{round_id}/download/prelim_summary?admin_password={admin_password}">Download Summary CSV</a> |
-        <a href="/admin/round/{round_id}/download/placements?admin_password={admin_password}">Download Placements CSV</a> |
-        <a href="/admin/round/{round_id}/download/raw_scores?admin_password={admin_password}">Download Raw Scores CSV</a>
+        <a href="/admin/round/{round_id}/download/prelim_summary">Download Summary CSV</a> |
+        <a href="/admin/round/{round_id}/download/placements">Download Placements CSV</a> |
+        <a href="/admin/round/{round_id}/download/raw_scores">Download Raw Scores CSV</a>
       </p>
 
       <table>
@@ -1109,12 +1219,12 @@ def admin_create_final_from_yes(
 # Admin downloads
 # -----------------------
 @app.get("/admin/round/{round_id}/download/raw_scores")
-def download_raw_scores(round_id: int, admin_password: str):
+def download_raw_scores(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT event_id FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
 
     _event_id, _round_type, scores_df, _comps = load_round_scores(round_id)
     out = scores_df.copy()
@@ -1129,12 +1239,12 @@ def download_raw_scores(round_id: int, admin_password: str):
 
 
 @app.get("/admin/round/{round_id}/download/placements")
-def download_placements(round_id: int, admin_password: str):
+def download_placements(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT event_id FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
 
     _event_id, _round_type, scores_df, _comps = load_round_scores(round_id)
     scores = scores_df.apply(pd.to_numeric, errors="coerce")
@@ -1155,12 +1265,12 @@ def download_placements(round_id: int, admin_password: str):
 
 
 @app.get("/admin/round/{round_id}/download/final_results")
-def download_final_results(round_id: int, admin_password: str):
+def download_final_results(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
         if rnd["round_type"] != "final":
             raise HTTPException(400, "Not a final round.")
 
@@ -1202,12 +1312,12 @@ def download_final_results(round_id: int, admin_password: str):
 
 
 @app.get("/admin/round/{round_id}/download/prelim_summary")
-def download_prelim_summary(round_id: int, admin_password: str):
+def download_prelim_summary(round_id: int, request: Request):
     with db() as conn:
         rnd = conn.execute("SELECT * FROM rounds WHERE id=?", (round_id,)).fetchone()
         if not rnd:
             raise HTTPException(404, "Round not found.")
-        require_admin(int(rnd["event_id"]), admin_password)
+        require_admin_session(int(rnd["event_id"]), request)
         if rnd["round_type"] != "prelim":
             raise HTTPException(400, "Not a prelim round.")
 
