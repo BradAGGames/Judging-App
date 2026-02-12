@@ -535,6 +535,7 @@ def admin_home():
       <form method="post" action="/admin/create">
         <div class="row">
           <input name="event_name" placeholder="Event name" required />
+          <input name="admin_password" placeholder="Admin password" type="password" required />
         </div>
         <button type="submit">Create</button>
       </form>
