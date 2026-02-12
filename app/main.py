@@ -661,9 +661,7 @@ def admin_event(event_id: int, request: Request):
 
       <h4 style="margin-top:16px;">Create Round</h4>
       <form method="post" action="/admin/event/{event_id}/create_round">
-        <div class="row">
-          <input name="admin_password" placeholder="Admin password" type="password" required />
-          <input name="round_name" placeholder="Round name (e.g., Prelims / Finals)" required />
+        <div class="row">          <input name="round_name" placeholder="Round name (e.g., Prelims / Finals)" required />
           <select id="roundType" name="round_type" required onchange="togglePrelimFields()">
             <option value="final">Final (Skating)</option>
             <option value="prelim">Prelim (Callback)</option>
@@ -730,7 +728,11 @@ or pipe:
     <div class="card">
       <h3>Delete Event</h3>
       <form method="post" action="/admin/event/{event_id}/delete" onsubmit="return confirm('Delete this event? This deletes rounds, judges, and marks.');">
-        <button type="submit" style="background:#ffe5e5;">Delete Event</button>
+        
+        <div class="row">
+          <input name="admin_password" placeholder="Admin password" type="password" required />
+        </div>
+<button type="submit" style="background:#ffe5e5;">Delete Event</button>
       </form>
     </div>
     """
@@ -739,13 +741,14 @@ or pipe:
 
 
 @app.post("/admin/event/{event_id}/login")
-def admin_event_login(event_id: int, admin_password: str = Form(...)):
+def admin_event_login(event_id: int, request: Request, admin_password: str = Form(...)):
+    # Verify password, then create a short-lived admin session cookie for this event.
     require_admin_session(event_id, request)
     token = create_admin_session(event_id)
     resp = RedirectResponse(url=f"/admin/event/{event_id}", status_code=303)
+    # Session cookie (no max-age) so it typically clears when the browser closes.
     resp.set_cookie("admin_session", token, httponly=True, samesite="lax")
     return resp
-
 
 @app.post("/admin/event/{event_id}/delete")
 def admin_delete_event(event_id: int, admin_password: str = Form(...)):
@@ -771,7 +774,7 @@ def admin_create_round(
     yes_count: Optional[int] = Form(None),
     alt_count: Optional[int] = Form(None),
 ):
-    require_admin(event_id, admin_password)
+    require_admin_session(event_id, request)
     round_type = round_type.strip().lower()
     if round_type not in ("final", "prelim"):
         raise HTTPException(400, "Invalid round type.")
@@ -799,7 +802,7 @@ def admin_create_round(
 
 @app.post("/admin/event/{event_id}/set_bibs")
 def admin_set_bibs(event_id: int, request: Request, bibs: str = Form("")):
-    require_admin(event_id, admin_password)
+    require_admin_session(event_id, request)
 
     bib_list = parse_bib_entries(bibs)
 
@@ -1175,7 +1178,7 @@ def admin_create_final_from_yes(
         if rnd["round_type"] != "prelim":
             raise HTTPException(400, "This action is only for prelim rounds.")
         event_id = int(rnd["event_id"])
-        require_admin(event_id, admin_password)
+        require_admin_session(event_id, request)
 
     # Compute current prelim results to determine Y promotions
     _event_id, _rt, scores_df, _comps_df = load_round_scores(round_id)
